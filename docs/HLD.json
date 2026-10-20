@@ -1,0 +1,413 @@
+{
+  "meta": {
+    "system": "n3x-plugin-core (registro, sessão, inventário, configs e usuários de leitura)",
+    "hld_owner": "Guilherme Giusti",
+    "version": "1.0",
+    "date": "2026-10-20"
+  },
+  "objective": {
+    "technical_goal": "Ser o plugin obrigatório do N3X, presente em todo build, com duas metades. A metade de proxy faz o login no controller, instala o interceptor de sessão na conexão compartilhada, registra o sidecar (identidade, alvo, versão do Envoy, manifesto, config efetiva mascarada e hash), mantém o heartbeat, envia eventos e avisa a saída. A metade de controller emite e valida o token HMAC, mantém em memória inventário, configs versionadas pelo hash, eventos e usuários de leitura, e fornece as telas de sidecars, configs, fluxo e usuários só com widgets do SDK. Atende o FR-016 e as partes de dados do FR-006, FR-007 e FR-009, além da sessão do FR-002 e do FR-005; na v1 tudo fica em memória e a auditoria (FR-010) fica para a v2. É dono do proto n3x.plugins.n3x.core.v1, do formato da config efetiva com mascaramento e hash, do token de sessão e da chave HMAC, do armazenamento do core e da seção plugins.n3x.core do n3x.yaml do controller.",
+    "problems_addressed": [
+      "O controller não tem armazenamento próprio; sem o core, o painel não teria inventário, configs nem usuários de leitura",
+      "As capacidades privilegiadas (interceptor, autenticador, rota pública de login e diretório de usuários) precisam de um único dono confiável",
+      "Sidecar e controller precisam de um único formato de registro e de config efetiva para detectar divergência entre instâncias sem expor segredo"
+    ],
+    "linked_systems": [
+      "n3x-sdk: contratos de plugin de proxy e de controller, capacidades privilegiadas (ADR-019 do SDK), plugin.Secret, widgets, memória isolada, padrão de IDs e de métricas e kit de testes",
+      "n3x-sidecar: conexão gRPC compartilhada com buffer de 1.000 itens, manifesto da seção ELF, canal de controle do entrypoint, identidade da instância e campo controller.heartbeat_interval",
+      "n3x-controller: servidor gRPC e interceptors, host de plugins, sessão do painel, root, verificador de credencial e log operacional do login do painel",
+      "n3x-builder: inclui o core sempre, na versão da imagem de build, e embute o manifesto lido pelo core"
+    ]
+  },
+  "architecture": {
+    "topology_overview": "Repositório Go com a estrutura padrão de plugin do SDK. A metade agent/ é compilada no libn3x.so do sidecar e a metade controller/ no binário do controller. As duas falam pelo serviço gRPC Core sobre a conexão TLS 1.3 do sidecar. Nenhum trabalho do core acontece no caminho da requisição: tudo roda em env.Background(). No controller, os componentes leem e escrevem na porta Store, implementada em memória na v1, e o painel lê snapshots imutáveis.",
+    "technologies": [
+      "Go 1.26 ou superior, sem cgo, log/slog",
+      "grpc-go e protobuf com buf generate e buf breaking na CI",
+      "crypto/hmac com SHA-256, crypto/rand e golang.org/x/crypto/bcrypt",
+      "JSON canônico RFC 8785 implementado no próprio core (hipótese)",
+      "n3x-sdk: proxy.Define, ctrl.Define, widgets, memory, plugin.Secret e kit de testes"
+    ],
+    "deployment": "hybrid",
+    "patterns": [
+      "Plugin de duas metades conforme o SDK, com capacidades privilegiadas exclusivas do ID n3x.core",
+      "Porta e adaptador no armazenamento: Store com implementação memory na v1 e banco na v2",
+      "Stream gRPC bidirecional para o heartbeat; unário para login, registro, eventos e saída",
+      "Estado observado com o sidecar como fonte de verdade, reconstruído após restart do controller",
+      "Snapshots imutáveis por serviço (copy-on-write) para leitura do painel sem lock",
+      "Evolução do proto só por adição, com proto_version no registro"
+    ]
+  },
+  "components": [
+    {
+      "name": "agent/session",
+      "responsibilities": [
+        "Login com prazo de 10 s",
+        "Guarda do token em env.Memory()",
+        "Interceptor que injeta o token e impõe min(ctx, 5 s)",
+        "Renovação em 80% do TTL com jitter de 10% e novo login em UNAUTHENTICATED"
+      ],
+      "dependencies": ["core/grpcconn do sidecar", "env.Memory()", "env.Background()", "controller.secret"]
+    },
+    {
+      "name": "agent/registrar",
+      "responsibilities": [
+        "Montar identidade, ler o manifesto ELF e gerar a config efetiva canônica",
+        "Mascarar segredos pelo schema e calcular o hash",
+        "Enviar Register após cada login e quando o ack pede resend_register"
+      ],
+      "dependencies": ["agent/session", "schemas dos plugins", "manifesto"]
+    },
+    {
+      "name": "agent/heartbeat",
+      "responsibilities": [
+        "Manter o stream no intervalo de controller.heartbeat_interval",
+        "Tratar o ack e reabrir o stream após queda, com backoff"
+      ],
+      "dependencies": ["agent/session", "env.Background()"]
+    },
+    {
+      "name": "agent/events",
+      "responsibilities": [
+        "Receber panic, disjuntor aberto, plugin desligado, erro de config, drenagem e segredo em claro",
+        "Gerar id de idempotência e enviar pelo buffer"
+      ],
+      "dependencies": ["buffer da conexão compartilhada"]
+    },
+    {
+      "name": "agent/exit",
+      "responsibilities": ["Chamar Exit em melhor esforço dentro dos 2 s do SIGTERM ou da drenagem"],
+      "dependencies": ["canal de controle do entrypoint"]
+    },
+    {
+      "name": "controller/auth",
+      "responsibilities": [
+        "Handler Login via PublicGRPC, conferindo a credencial com env.Credentials().Verify e emitindo o token",
+        "Authenticate para o interceptor do host",
+        "Dono da chave HMAC"
+      ],
+      "dependencies": ["env.Credentials()", "session.hmac_key"]
+    },
+    {
+      "name": "controller/registry",
+      "responsibilities": [
+        "Serviço Core: validar campos, proto_version, hash e identidade contra o token",
+        "Repassar para inventory e configs"
+      ],
+      "dependencies": ["controller/auth", "controller/inventory", "controller/configs"]
+    },
+    {
+      "name": "controller/inventory",
+      "responsibilities": [
+        "Instâncias e sessões, estados conectado, desconectado e histórico",
+        "Conflito de identidade, divergência de manifesto e eventos"
+      ],
+      "dependencies": ["Store"]
+    },
+    {
+      "name": "controller/configs",
+      "responsibilities": [
+        "Versões de config por hash e config atual de cada instância",
+        "Divergência de config no serviço e diff entre versões e instâncias"
+      ],
+      "dependencies": ["Store"]
+    },
+    {
+      "name": "controller/directory",
+      "responsibilities": [
+        "Usuários de leitura vindos do n3x.yaml",
+        "CheckUser com bcrypt; ChangePassword devolve não suportado"
+      ],
+      "dependencies": ["config tipada do core"]
+    },
+    {
+      "name": "controller/store/memory",
+      "responsibilities": [
+        "Implementação em memória da porta Store",
+        "Contabilidade de bytes, teto, ordem de descarte e snapshots imutáveis"
+      ],
+      "dependencies": ["nenhuma"]
+    },
+    {
+      "name": "controller/janitor",
+      "responsibilities": [
+        "Marcar desconectado após 3 intervalos sem heartbeat",
+        "Mover para o histórico após inventory_retention e aplicar retenções e descarte"
+      ],
+      "dependencies": ["controller/inventory", "controller/configs", "env.Background()"]
+    },
+    {
+      "name": "controller/panel",
+      "responsibilities": ["Telas com widgets (sidecars, configs, fluxo e usuários) e cartões da visão geral"],
+      "dependencies": ["controller/inventory", "controller/configs", "controller/directory"]
+    },
+    {
+      "name": "controller/metrics",
+      "responsibilities": ["Métricas de negócio n3x_n3x_core_*"],
+      "dependencies": ["env.Metrics()"]
+    },
+    {
+      "name": "proto/ e types/",
+      "responsibilities": [
+        ".proto do serviço Core com stubs gerados",
+        "Structs de config das duas metades com tags n3x e desc"
+      ],
+      "dependencies": ["buf", "n3x-sdk"]
+    }
+  ],
+  "flows": {
+    "request_flow": [
+      "Subida do sidecar: agent/session cria o interceptor e chama Login(serviço, instância, segredo) com prazo de 10 s",
+      "Login no controller: o host aplica limites por IP e serviço (RESOURCE_EXHAUSTED se bloqueado); controller/auth chama env.Credentials().Verify (bcrypt com cache de 1 h por serviço e até 2 simultâneos) e emite o token sobre serviço, instância, emitido em, expira em e nonce, com TTL de 1 h",
+      "Registro: agent/registrar envia Register; o interceptor do host valida o token com Authenticate; controller/registry valida major (FAILED_PRECONDITION), campos (INVALID_ARGUMENT), identidade contra o token (PERMISSION_DENIED com log de alerta) e hash (DATA_LOSS)",
+      "Com tudo válido: upsert da instância pela identidade, nova versão de config se o hash for novo (RESOURCE_EXHAUSTED sem memória) e recálculo das divergências do serviço",
+      "Heartbeat: ping a cada intervalo, ack em menos de 50 ms com resend_register quando o controller não conhece a instância",
+      "Eventos: Event unário com id, pelo buffer de 1.000 itens quando o controller está fora; o controller ignora id repetido",
+      "Saída: Exit(reason) dentro dos 2 s do SIGTERM; o controller marca desconectado na hora",
+      "Painel: polling de 5 s do host lê snapshots do Store",
+      "Controller fora do ar: sidecar segue em standalone, eventos no buffer e login com backoff de 1 a 60 s e jitter de 20%",
+      "Restart com session.hmac_key: tokens continuam válidos, primeiro heartbeat recebe resend_register e o inventário volta em cerca de 10 s",
+      "Restart sem session.hmac_key: tokens invalidados, novo login com jitter e reenvio do registro, com cerca de um bcrypt por serviço graças ao cache do host",
+      "Três intervalos sem heartbeat: desconectado; após 24 h, histórico",
+      "Conflito de identidade: segundo Register com mesma identidade e outro nonce, com as duas sessões mandando heartbeat no mesmo intervalo; ambas continuam e o conflito se resolve após 3 intervalos sem heartbeat da antiga",
+      "Segredo em claro: sidecar envia ***:plain e o evento secret_in_clear; o valor nunca sai do processo"
+    ],
+    "data_flow": [
+      "n3x.yaml do serviço e defaults dos plugins → config efetiva → JSON canônico RFC 8785 → mascaramento pelo schema → hash sha256 → Register → recálculo no controller → ConfigVersion deduplicada em memória → diff e divergência → painel",
+      "Manifesto ELF .n3x_manifest → Register → Manifest deduplicado → comparação com o manifesto do controller → alerta de plugins diferentes",
+      "Core do sidecar → agent/events → buffer → Event → até 200 eventos por instância em memória → detalhe do sidecar",
+      "Heartbeat → visto por último → janitor → estado → cartões e métricas",
+      "Seção users do n3x.yaml do controller → Validate → directory em memória → CheckUser no login do painel",
+      "Nada é persistido nem replicado na v1; a perda no restart é compensada pela reconstrução feita pelos sidecars"
+    ]
+  },
+  "data_model": {
+    "entities": [
+      "Service: nome do serviço, agrupa as instâncias",
+      "Instance: serviço, instância, endereço, alvo, versão do Envoy, estado, visto por último, ponteiros para manifesto e config atual e histórico de hashes",
+      "Session: nonce, emitido em, expira em, intervalo do heartbeat e último ping",
+      "Manifest: plugins, versões e metades, guardado pelo hash do manifesto",
+      "ConfigVersion: hash sha256 e config efetiva mascarada em JSON canônico, deduplicada entre instâncias",
+      "Event: id, instância, tipo, plugin, detalhe e horário",
+      "User: nome, hash bcrypt e desativado, carregado do n3x.yaml na subida",
+      "Formato da config efetiva 1: {format, sidecar, plugins: [{id, instance, phase, order, failure, config}]}; segredos pelo schema e controller.secret viram ***:<12 hex do SHA-256 do texto ENC[...]>; segredo sem ENC vira ***:plain; hash sha256:<hex> do JSON canônico mascarado"
+    ],
+    "relationships": [
+      "Service 1:N Instance",
+      "Instance 1:N Session; mais de uma sessão ativa significa conflito de identidade",
+      "Instance N:1 Manifest e N:1 ConfigVersion atual, com histórico de hashes",
+      "ConfigVersion compartilhada por todas as instâncias com o mesmo hash",
+      "Instance 1:N Event (até 200)",
+      "User independente das demais entidades",
+      "Retenção: histórico de 24 h, até 20 versões de config por serviço, até 200 eventos por instância e teto de 128 MiB"
+    ],
+    "source_of_truth": "O sidecar é a fonte de verdade do estado observado (inventário, manifesto, config e eventos), espelhado em memória pelo core; a seção plugins.n3x.core.users do n3x.yaml do controller é a fonte dos usuários de leitura; o root fica no n3x.yaml do host"
+  },
+  "interfaces": [
+    {
+      "name": "n3x.plugins.n3x.core.v1.Core/Login",
+      "kind": "api",
+      "protocol": "gRPC (protobuf) sobre TLS 1.3, rota pública sem sessão",
+      "exposure": "internal",
+      "sla_limits": "p95 < 300 ms; limites de login do host por IP e serviço"
+    },
+    {
+      "name": "n3x.plugins.n3x.core.v1.Core/Register",
+      "kind": "api",
+      "protocol": "gRPC unário",
+      "exposure": "internal",
+      "sla_limits": "Mensagem até 1 MiB; p95 < 20 ms"
+    },
+    {
+      "name": "n3x.plugins.n3x.core.v1.Core/Heartbeat",
+      "kind": "stream",
+      "protocol": "gRPC bidirecional",
+      "exposure": "internal",
+      "sla_limits": "Ack < 50 ms; 1 s por mensagem processada; fora do teto de 10 s das chamadas unárias"
+    },
+    {
+      "name": "n3x.plugins.n3x.core.v1.Core/Event",
+      "kind": "api",
+      "protocol": "gRPC unário, idempotente por id",
+      "exposure": "internal",
+      "sla_limits": "p95 < 20 ms"
+    },
+    {
+      "name": "n3x.plugins.n3x.core.v1.Core/Exit",
+      "kind": "api",
+      "protocol": "gRPC unário, melhor esforço",
+      "exposure": "internal",
+      "sla_limits": "Dentro dos 2 s do desligamento"
+    },
+    {
+      "name": "Capacidades privilegiadas (PublicGRPC, Authenticate, CheckUser, ConnInterceptors)",
+      "kind": "sdk",
+      "protocol": "Interfaces Go do ADR-019 do n3x-sdk",
+      "exposure": "internal",
+      "sla_limits": "Authenticate sem alocação no caminho comum; CheckUser dominado pelo bcrypt"
+    },
+    {
+      "name": "Telas /plugins/n3x/core/{sidecars,configs,fluxo,usuarios} e cartões",
+      "kind": "sdk",
+      "protocol": "Árvore de widgets renderizada pelo host (HTTPS)",
+      "exposure": "internal",
+      "sla_limits": "Página até 10 s e cartão até 1 s; meta de p95 < 300 ms com 500 sidecars"
+    },
+    {
+      "name": "Métricas n3x_n3x_core_*",
+      "kind": "api",
+      "protocol": "Prometheus pelo endpoint do controller",
+      "exposure": "internal",
+      "sla_limits": "Atualizadas a cada mudança de estado"
+    }
+  ],
+  "scalability_availability": {
+    "strategies": [
+      "Uma réplica do controller e escala vertical: 500 sidecars dentro de 150 MB e 0,15 vCPU para o core e seus dados",
+      "Core sem hooks de requisição: nunca afeta o tráfego; sem controller, o sidecar fica em standalone",
+      "Estado reconstruído pelos sidecars após restart",
+      "Teto de memória com descarte acima de 90%: histórico, depois eventos mais antigos, depois versões de config sem instância; se estourar, degradado, segue com heartbeats e estados e recusa nova config com RESOURCE_EXHAUSTED",
+      "Controle de vazão no host: 1.000 conexões, 16 streams por conexão, mensagens até 4 MiB e limites de login",
+      "Rajadas de reconexão suavizadas por jitter e backoff; com chave fixa, restart não gera novo login",
+      "Heartbeat O(1) por ping, alvo de 50 pings por segundo com 500 sidecars a cada 10 s"
+    ],
+    "caching": "Configs deduplicadas por hash e manifestos pelo hash do manifesto; snapshots imutáveis por serviço para leitura do painel sem lock; cache de credencial por serviço fica no host",
+    "partitioning": "Sem particionamento na v1 (uma réplica); estruturas em memória separadas por serviço",
+    "sla_target": "Controller 99,5% ao mês; zero erros de tráfego causados pelo core; volta ao painel após restart em cerca de 10 s com session.hmac_key e em até 30 s sem ela, até cerca de 200 serviços"
+  },
+  "security": {
+    "authentication": "Sidecar faz login com o segredo do serviço (ENC[...]), conferido pelo host com bcrypt custo ≥ 12; recebe token HMAC-SHA256 sobre serviço, instância, emitido em, expira em e nonce, TTL de 1 h, renovação em 80%, validado com hmac.Equal e guardado só na memória isolada do core. Chave HMAC do core: 32 bytes aleatórios no Start ou session.hmac_key em ENC[...], recomendada em produção. Painel: root conferido pelo host e usuários de leitura pelo CheckUser do core; bloqueio de 5 tentativas por 15 min no host",
+    "authorization": "Register, Heartbeat, Event e Exit só aceitam identidade igual à do token (PERMISSION_DENIED com log de alerta); só o papel sidecar chama o serviço Core; telas sidecars, configs e fluxo exigem leitura e usuários exige root; capacidades privilegiadas só para n3x.core de github.com/giustech/n3x-plugin-core",
+    "secrets_management": "Valores ENC[...] da seção do core decifrados pelo host antes do New e entregues como plugin.Secret; o core nunca importa secret/; no sidecar o .so decifra controller.secret. Rotação da hmac_key e de senhas de leitura: editar o yaml e reiniciar o controller",
+    "encryption_in_transit": "TLS 1.3 na conexão compartilhada e HTTPS no painel",
+    "encryption_at_rest": "Não há dados em repouso: tudo em memória; hmac_key em ENC[...] (AES-256-GCM) e password_hash marcados como segredo no schema, fora do painel e dos logs",
+    "pii_policy": "IP e nome de usuário só em memória, até 24 h no histórico, acesso só autenticado; nenhum token, segredo, hash de senha ou config sem máscara em log, erro ou evento, garantido por testes de varredura e análise estática; sem trilha formal de auditoria na v1, com login, logout e bloqueio no log operacional do host"
+  },
+  "observability": {
+    "logs": "JSON por log/slog com plugin=n3x.core, serviço, instância e x-request-id. Sidecar: login, registro enviado com hash, queda e reabertura do stream, recusas com código e secret_in_clear. Controller: registro aceito ou recusado, mudança de hash, conflito, divergência, transição de estado, entrada e saída do degradado, aviso de hmac_key ausente e PERMISSION_DENIED. Nível info; heartbeat só em debug",
+    "metrics": [
+      "n3x_n3x_core_sidecars{state}",
+      "n3x_n3x_core_divergences{service,kind=config|manifest}",
+      "n3x_n3x_core_identity_conflicts",
+      "n3x_n3x_core_registers_total{result}",
+      "n3x_n3x_core_logins_total{result}",
+      "n3x_n3x_core_events_total{kind}",
+      "n3x_n3x_core_memory_bytes",
+      "n3x_n3x_core_degraded",
+      "n3x_n3x_core_heartbeat_lag_seconds (histograma)",
+      "Sidecar: n3x_controller_connected, n3x_controller_session_age_seconds, n3x_controller_logins_total{result}, n3x_controller_buffer_items e n3x_controller_buffer_dropped_total, alimentadas pelo core",
+      "Latência e erros por RPC pelo interceptor de métricas do host"
+    ],
+    "tracing": "Sem tracing distribuído na v1; correlação por x-request-id e por serviço e instância nos logs dos dois lados",
+    "dashboards_alerts": [
+      "Cartões da visão geral: sidecars por estado, divergências e alertas (conflitos, segredo em claro, degradado)",
+      "Alerta: n3x_n3x_core_degraded == 1 por 5 min",
+      "Alerta: sidecars desconectados acima de 10% do total por 5 min",
+      "Alerta: n3x_n3x_core_identity_conflicts > 0",
+      "Alerta: divergência de config num serviço por mais de 30 min",
+      "Alerta: taxa alta de n3x_n3x_core_logins_total{result=\"fail\"}",
+      "SLO: percentual de sidecars conectados e tempo de reconstrução do inventário após restart (≤ 30 s)"
+    ]
+  },
+  "risks": [
+    {
+      "risk": "Perda do inventário e das configs a cada restart do controller",
+      "probability": "high",
+      "impact": "Painel vazio até os sidecars se reapresentarem; histórico de divergências e de hashes perdido",
+      "mitigation": [
+        "session.hmac_key fixa em produção, para não precisar de novo login",
+        "resend_register no ack do heartbeat",
+        "Meta de 30 s medida na CI"
+      ],
+      "contingency_plan": "Implementar um adaptador de banco na porta Store (v2, junto com a auditoria)"
+    },
+    {
+      "risk": "Ausência de auditoria formal na v1",
+      "probability": "medium",
+      "impact": "Sem trilha de quem acessou o painel, lacuna de rastreabilidade e de LGPD",
+      "mitigation": [
+        "Log operacional do host com login, logout e bloqueio",
+        "Usuários só pelo yaml, com mudanças versionadas no repositório de deploy"
+      ],
+      "contingency_plan": "Antecipar o FR-010 na v2 com banco, atrás da mesma porta Store"
+    },
+    {
+      "risk": "Estouro de memória com configs grandes ou muitos eventos",
+      "probability": "low",
+      "impact": "Core degradado e novas versões de config recusadas",
+      "mitigation": [
+        "memory_limit de 128 MiB com contabilidade",
+        "Deduplicação por hash",
+        "Ordem de descarte definida",
+        "Register limitado a 1 MiB",
+        "Métrica e alerta"
+      ],
+      "contingency_plan": "Aumentar o memory_limit ou reduzir retenções e o limite de eventos"
+    },
+    {
+      "risk": "Mudança incompatível no proto quebrando sidecars antigos",
+      "probability": "medium",
+      "impact": "Sidecars sem registro e fora do painel, sem afetar o tráfego",
+      "mitigation": [
+        "buf breaking em todo PR",
+        "Evolução só por adição",
+        "proto_version no Register",
+        "Teste cruzado entre sidecar N-1 e controller N"
+      ],
+      "contingency_plan": "Controller aceita a major anterior durante uma janela de transição, a ser definida"
+    },
+    {
+      "risk": "Mascaramento deixando passar um segredo",
+      "probability": "low",
+      "impact": "Alto: segredo apareceria no painel ou num log",
+      "mitigation": [
+        "Mascaramento dirigido pelo schema (plugin.Secret)",
+        "Impressão digital sobre o cifrado",
+        "***:plain com alerta",
+        "Varredura de segredos na CI",
+        "Teste de propriedade com campos de segredo aleatórios"
+      ],
+      "contingency_plan": "Corrigir o mascaramento no sidecar e limpar as configs em memória com restart do controller (hipótese: ação de limpeza no painel na v2)"
+    },
+    {
+      "risk": "Conflito de identidade falso (pod reiniciando antes de o Exit chegar)",
+      "probability": "medium",
+      "impact": "Alerta falso no painel",
+      "mitigation": [
+        "Exit marca desconectado na hora",
+        "Conflito só declarado com as duas sessões mandando heartbeat no mesmo intervalo"
+      ],
+      "contingency_plan": "Conflito se resolve sozinho após 3 intervalos sem heartbeat da sessão antiga"
+    }
+  ],
+  "adrs_next_steps": {
+    "adrs": [
+      "ADR-001 – Armazenamento só em memória na v1, atrás da porta Store",
+      "ADR-002 – Auditoria adiada para a v2",
+      "ADR-003 – Usuários de leitura só pelo n3x.yaml",
+      "ADR-004 – Chave HMAC do core, aleatória ou session.hmac_key",
+      "ADR-005 – Token de sessão com nonce, TTL de 1 h e identidade amarrada",
+      "ADR-006 – Config efetiva em JSON canônico, impressão digital de segredos e hash SHA-256",
+      "ADR-007 – Proto Core com heartbeat bidirecional e proto_version",
+      "ADR-008 – Core sem hooks de requisição",
+      "ADR-009 – Teto de memória, ordem de descarte e estado degradado",
+      "ADR-010 – Métricas n3x_n3x_core_* e sem tracing na v1",
+      "Referenciados: ADR-003, ADR-005, ADR-016, ADR-017, ADR-019, ADR-020 e ADR-022 do n3x-sdk e ADR-003 do n3x-builder"
+    ],
+    "pending_decisions": [
+      "Banco da v2 (Postgres ou outro): decidir quando a auditoria voltar ou o controller precisar de mais de uma réplica",
+      "Canal de drenagem no modo Istio: pendente no HLD do sidecar; o core só consome o evento",
+      "Janela de aceitação da major anterior do proto: decidir na primeira quebra real"
+    ],
+    "next_steps": [
+      "Escrever o .proto final e configurar buf generate e buf breaking",
+      "Escrever o n3x-plugin.yaml do core: duas metades, controller.required true e nenhuma fase",
+      "Escrever as structs de types/ das duas metades com o schema gerado",
+      "Implementar JSON canônico, mascaramento e hash com testes de propriedade e de varredura de segredos",
+      "Implementar a porta Store e o adaptador memory com contabilidade de bytes e benchmark de 500 sidecars",
+      "Montar as telas com widgets e testar acessibilidade (axe) no painel do controller",
+      "Teste de ponta a ponta de restart do controller com e sem hmac_key, medindo a meta de 30 s",
+      "Escrever o LLD/FDD do core"
+    ]
+  }
+}
