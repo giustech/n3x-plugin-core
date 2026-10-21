@@ -1,0 +1,1054 @@
+{
+  "meta": {
+    "product_or_system": "n3x-plugin-core, pacotes agent, agent/registrar, agent/heartbeat, agent/events, agent/exit, agent/internal/link, agent/agenttest e internal/eventid",
+    "feature_name": "Agente do core no sidecar: registro, heartbeat, eventos e saída (CORE-06)",
+    "fdd_owner": "Guilherme Giusti",
+    "version": "1.0",
+    "date": "2026-10-21"
+  },
+  "context": {
+    "technical_motivation": "A metade de proxy do plugin core (agent/, dentro do libn3x.so) é quem faz o sidecar aparecer no painel. Ela precisa, sem tocar no caminho da requisição: enviar o Register com identidade, alvo, versão do Envoy, manifesto, config efetiva mascarada e hash; manter um stream de Heartbeat com ping a cada controller.heartbeat_interval; transformar os acontecimentos do core do sidecar (panic, disjuntor, plugin desligado, erro de config, segredo em claro, início da drenagem) em Event com ID de idempotência; e avisar a saída com Exit dentro da janela de desligamento. As peças já existem em FDDs anteriores, mas faltava o comportamento que as liga: quando cada RPC sai, com que prazo, o que fazer com cada código de erro, como o heartbeat sobrevive à renovação do token, como os eventos sobrevivem à queda do controller e qual é a ordem das mensagens que o controller (FDD 43) vai receber.",
+    "fit_with_hld": "O HLD do n3x-plugin-core põe o trabalho em quatro componentes, agent/registrar, agent/heartbeat, agent/events e agent/exit. Esta FDD especifica os quatro, mais a composição em agent.New, um pacote interno de coordenação (agent/internal/link) e o formato do ID de evento (internal/eventid, compartilhado com a metade de controller). Ela consome, sem redefinir:\n- a visão proxy.CoreEnv.Sidecar() da FDD 09 (L-01): Identity(), ControllerSettings(), Manifest(), NextEvent(ctx), Draining(), ExitContext() e Session()\n- a identidade da instância da FDD 25 (SidecarIdentity{Service, Instance, Address, EnvoyVersion}, contrato 9 dela): o core nunca detecta nada\n- a config efetiva da FDD 37 (effective.Compute devolve effconfig.Result, calculado uma vez em agent.New)\n- a sessão da FDD 39 (session.Manager, Next(ctx, after), interceptors que anexam o token)\n- a conexão compartilhada da FDD 38 (env.Controller(), proxy.Buffered(), teto de 5 s nas unárias, stream sem teto, 2 streams por plugin, ExitContext com a conexão viva)\n- os eventos da contenção de falhas da FDD 18 (panic com Suppressed, breaker_open, plugin_disabled) e da subida da FDD 17 (config_error, secret_in_clear)\n- a drenagem da FDD 29 (Draining() e drain_start no mesmo instante; pelo menos min(3 s, T) antes do cancelamento; stop antes do SIGTERM ao Envoy)\n- o proto Core da FDD 36 (mensagens, limites e corev1.MaxRegisterBytes)\n\nRastreabilidade:\n- PRD 1.5: FR-016 (registro, heartbeat com controller.heartbeat_interval, eventos com ID de idempotência, saída em até 2 s, nada no caminho do tráfego, erros INVALID_ARGUMENT, PERMISSION_DENIED, DATA_LOSS, RESOURCE_EXHAUSTED, FAILED_PRECONDITION), FR-002 (buffer com descarte dos mais antigos, registro reenviado após novo login), FR-006 (detalhe com eventos), critério \"sidecar de volta em até 30 s\"\n- ADRs do n3x-plugin-core: ADR-005, ADR-006, ADR-007, ADR-008 e ADR-010; ADRs do n3x-sdk: ADR-016, ADR-019 e ADR-022; ADRs do n3x-sidecar: ADR-004 e ADR-006\n- Lacunas do README: nenhuma é fechada só aqui. Aplicadas: L-01 (interface da FDD 09), L-08 (heartbeat sem teto, FDD 38), L-12 (n3x_controller_* pela FDD 38 e pelo SessionReporter), L-18 (drenagem no Istio fica para a FDD 49), L-44 (partição do buffer), L-51 (6 tarefas no limite de 8). Proposta para a L-65 (deduplicação por último seq, pedido à FDD 43)\n- FDDs consumidas: 06, 09, 12, 17, 18, 22, 25, 29, 33, 36, 37, 38, 39 e 41\n- Pedidos do registro atendidos: FDD 06 (tarefas do core), FDD 09 (id a partir de Seq), FDDs 09, 37 e 42 (config_hash pela Compute), FDD 12 (vetor do panic de ponta a ponta), FDD 18 (mapear panic, breaker_open e plugin_disabled), FDD 22 (teste de constantes e conferência antes do envio), FDD 25 (contrato 9 da identidade), FDD 29 (drenagem e Exit), FDD 36 (conversão do evento, FAILED_PRECONDITION, register_too_large), FDD 37 (usar o Result e definir o caso sem config efetiva), FDD 38 (eventos com Buffered, Register e Exit diretos, ctx por stream), FDD 39 (Next em laço, troca do stream na renovação, Exit com o token atual), FDD 41 (nova tentativa depois de RESOURCE_EXHAUSTED)",
+    "actors": [
+      "Executor e contenção de falhas do .so (produzem os eventos e criam a instância core)",
+      "Entrypoint e canal de controle (drenagem, FDD 29)",
+      "Conexão compartilhada (FDD 38)",
+      "Gerenciador de sessão (FDD 39)",
+      "Servidor gRPC do controller (FDD 33)",
+      "Registry do core no controller (FDD 43, que depende desta e recebe o contrato de mensagens do contrato 8)"
+    ],
+    "assumptions": [
+      "O SDK compilado no .so tem proxy.CoreEnv, proxy.Sidecar com SetConfigHash, proxy.EventQueue, proxy.ExitTimeout, proxy.Buffered e proxy.Sleep (FDDs 06, 09, 37 e 38)",
+      "O core é compilado com a mesma versão do SDK que o runtime (FDD 20, L-57), então todo proxy.EventKind que chega é conhecido",
+      "O controller responde um HeartbeatAck por ping, na ordem, em menos de 50 ms (HLD do core); o servidor corta o stream que fica mais de 1 s processando uma mensagem (FDD 33)"
+    ],
+    "constraints": [
+      "Esta FDD não define a interface do core do sidecar (FDD 09), o login, o token e a renovação (FDD 39), o formato da config efetiva (FDD 37), o buffer, o backoff da conexão e o keepalive (FDD 38), o disparo do disjuntor (FDD 18) e da drenagem (FDD 29), nem o processamento no controller (FDD 43). Daqui saem os pedidos à FDD 43 sobre como interpretar o que o agente envia.",
+      "Nenhum hook de requisição; tudo em env.Background() registrado durante o New (ADR-008 do core, FDD 06)",
+      "As regras da análise estática valem para o core sem exceção (FDD 24): sem instrução go, sem context.Background, sem ctx guardado em campo, esperas por proxy.Sleep, canal sempre em select com ctx.Done()",
+      "No máximo 2 streams por plugin na conexão compartilhada (FDD 38); o core usa 1",
+      "Nenhum token, segredo ou trecho de config sem máscara em log, métrica ou evento"
+    ]
+  },
+  "technical_objectives": [
+    {
+      "objective": "Custo zero no caminho da requisição.",
+      "measure_or_invariant": "Invariante: a instância core não declara hook (proxy.HooksOf vazio, CheckPrivileged passa com background_only_hooks); o p99 do sidecar com o core ativo e o controller fora do ar fica dentro de 10% do standalone (critério da FDD 38)."
+    },
+    {
+      "objective": "Registro rápido e completo.",
+      "measure_or_invariant": "Medida: com o controller no ar, o primeiro Register sai em até 100 ms depois do primeiro login (relógio falso); cada sessão nova (primeira, renovação ou novo login) gera exatamente um Register bem-sucedido; o resend_register gera o Register em até ResendSpread (5 s com o padrão)."
+    },
+    {
+      "objective": "Volta ao painel depois de queda do controller.",
+      "measure_or_invariant": "Medida: depois de a conexão voltar a READY, o heartbeat reabre em até 1 s e o Register pedido pelo ack chega em até 6 s; o agente soma no máximo isso ao tempo de reconexão da FDD 38."
+    },
+    {
+      "objective": "Heartbeat contínuo, inclusive na renovação.",
+      "measure_or_invariant": "Invariante: no máximo um stream de heartbeat aberto por processo; na troca de sessão, o stream antigo fecha antes de o novo abrir e o novo manda o primeiro ping na hora; nenhum ping sai com token vencido. Medida: com TTL de 5 min por 1 h (relógio falso), 0 intervalos sem ping no controller falso."
+    },
+    {
+      "objective": "Eventos sem perda evitável e sem duplicação no controller.",
+      "measure_or_invariant": "Medida: com o controller fora do ar por 2 min e 1.200 eventos, os mais novos que cabem na fila e no buffer chegam em ordem crescente de seq, cada id contado uma vez pelo controller falso que deduplica; as perdas aparecem em n3x_sidecar_events_dropped_total e n3x_controller_buffer_dropped_total."
+    },
+    {
+      "objective": "Saída avisada.",
+      "measure_or_invariant": "Medida: Exit enviado e respondido em até 1,5 s depois do cancelamento das tarefas em 100% das paradas com o controller no ar; reason drain quando a drenagem começou, sigterm quando não."
+    },
+    {
+      "objective": "Sem vazamento.",
+      "measure_or_invariant": "Medida: depois do Stop, 0 goroutines das tarefas do core em até 2 s; teste de 10 min (relógio falso) com 200 quedas e voltas do controller e 20 renovações termina com o número de goroutines igual ao do início, com tolerância de 2."
+    }
+  ],
+  "scope": {
+    "included": [
+      "agent.New: composição das tarefas, modos de operação (inativo, sem registro, ativo) e decisão sem config efetiva",
+      "agent/registrar: montagem do RegisterRequest uma vez por processo, conferência de tamanho (register_too_large), gatilhos (sessão nova por Next, resend_register, nova tentativa), classificação de cada código de erro, backoff e espalhamento",
+      "agent/heartbeat: abertura do stream com WaitForReady, ping com seq e sent_at, espera do ack, resend_register, troca do stream na renovação, reabertura com backoff, ctx próprio por stream cancelado quando o ack não chega",
+      "agent/events: consumo de NextEvent, conversão para EventRequest, ID de idempotência, envio com proxy.Buffered(), espera do primeiro registro",
+      "agent/exit: Exit direto com ExitContext() no cancelamento, reason drain ou sigterm",
+      "agent/internal/link (coordenação entre as tarefas) e internal/eventid (formato do ID de evento, usado também pela FDD 43)",
+      "Contrato de mensagens para a FDD 43: ordem, seq, deduplicação, sessões, troca do stream e conflito de instância",
+      "Métricas n3x_n3x_core_agent_* do sidecar e os logs do agente",
+      "Kit de teste do agente (agent/agenttest.FakeCore) e os critérios de aceite com ctrltest.Link"
+    ],
+    "excluded": [
+      "Interface proxy.Sidecar, EventQueue e ExitContext: FDD 09 (SDK-09); aqui só consumidas",
+      "Login, token, renovação, interceptors e SessionReporter: FDD 39 (CORE-03)",
+      "Montagem, mascaramento e hash da config efetiva, SetConfigHash: FDD 37 (CORE-02)",
+      "Buffer, partição, backoff da conexão, keepalive e ExitContext do lado da conexão: FDD 38 (SID-10)",
+      "Validação do Register, inventário, sessões, conflito, deduplicação e retenções no controller: FDD 43 (CORE-07)",
+      "Disparo do disjuntor e da drenagem: FDDs 18 (SID-04) e 29 (SID-09); fonte da drenagem no Istio: FDD 49 (SID-11)",
+      "Métricas n3x_controller_* do sidecar (connected, buffer_*, session_age_seconds, logins_total): FDDs 38 e 39, publicadas pela FDD 16",
+      "Consolidação das métricas e alertas do core: FDD 45 (CORE-09)"
+    ]
+  },
+  "detailed_flows": {
+    "main_flow": [
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 1: env.(proxy.CoreEnv); sem a visão, erro e o Envoy não sobe (FDD 36, contrato 8).",
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 2: res, effErr := effective.Compute(cenv) (FDD 37): roda sempre, também no standalone, e já entrega o hash a n3x_build_info por SetConfigHash. O agente guarda res e nunca recalcula.",
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 3: conn, err := env.Controller(). Com proxy.ErrStandalone, ou com ControllerSettings() falso (defensivo), o agente fica inativo: nenhuma tarefa, nenhuma métrica agent_*, log agent_inactive com reason=standalone, e New devolve a instância.",
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 4: Cria o session.Manager (FDD 39) e registra a tarefa session. Ela é registrada antes de qualquer decisão de registro, porque os outros plugins dependem do token.",
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 5: Sem config efetiva (effErr != nil): modo sem registro (hipótese H-11), log agent_unregistered com reason=effective_config; nenhuma outra tarefa. A fila de eventos não é consumida e descarta o mais antigo, contado em n3x_sidecar_events_dropped_total (FDD 09).",
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 6: Monta o RegisterRequest uma vez (contrato 2): proto_version = corev1.Version(), identidade de Sidecar().Identity(), target = env.Target().Name(), envoy_version, manifest = Sidecar().Manifest(), config = res.Document, config_hash = res.Hash, heartbeat_interval = ControllerSettings().HeartbeatInterval. Confere os limites da FDD 36 e o tamanho serializado contra corev1.MaxRegisterBytes. Acima do teto: log register_too_large (error, com os tamanhos), modo sem registro com reason=register_too_large.",
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 7: Modo ativo: cria as métricas, o link.State, o nonce de eventos (8 bytes de crypto/rand) e registra as tarefas registrar, heartbeat, heartbeat_recv, events e exit (6 no total com a session, dentro do padrão de 8 da FDD 06). Log agent_ready com mode, tasks, register_bytes, config_hash e heartbeat_interval_ms.",
+      "Subida (agent.New, dentro do Instantiate de 5 s da FDD 17), passo 8: As tarefas começam depois da subida inteira (FDD 06).",
+      "Registro (tarefa registrar), passo 1: Guarda last = 0 (num reinício por panic também começa em 0, o que refaz o Register da sessão atual).",
+      "Registro (tarefa registrar), passo 2: info, err := session.Next(espera, last), em que espera é um ctx derivado da tarefa que o Resend cancela. Com sessão nova, last = info.Generation e segue para o envio.",
+      "Registro (tarefa registrar), passo 3: Envio: ctx de chamada com marca de segundo plano (a da tarefa), x-request-id novo (telemetry.ContextWithRequestID) e grpc.WaitForReady(true); o teto de 5 s é da visão (FDD 38). O interceptor do core anexa o token da sessão atual (FDD 39).",
+      "Registro (tarefa registrar), passo 4: Resultado, pela tabela do contrato 3:",
+      "Registro (tarefa registrar), passo 4.1: OK: link.SetRegistered(gen), log register_sent (hash, geração, tipo de sessão, versão do proto do controller, bytes, duração, request_id), agent_registered em 1",
+      "Registro (tarefa registrar), passo 4.2: RESOURCE_EXHAUSTED: registro parcial (H-09): link.SetRegistered(gen) com partial, log register_failed class=exhausted, nova tentativa com backoff até OK",
+      "Registro (tarefa registrar), passo 4.3: transitório (UNAVAILABLE, DEADLINE_EXCEEDED, ABORTED, INTERNAL, UNKNOWN e outros): backoff de 1 s a 60 s, multiplicador 1,6, jitter de 20%",
+      "Registro (tarefa registrar), passo 4.4: UNAUTHENTICATED: a sessão foi recusada; o interceptor já disparou o novo login (FDD 39); o registrador volta a esperar Next",
+      "Registro (tarefa registrar), passo 4.5: UNIMPLEMENTED: controller com o core mínimo v0.1.0 (FDD 36); espera fixa de 60 s com jitter de 20%",
+      "Registro (tarefa registrar), passo 4.6: recusa do conteúdo (INVALID_ARGUMENT, PERMISSION_DENIED, DATA_LOSS, FAILED_PRECONDITION): log register_rejected (error); nenhuma nova tentativa nesta sessão; a próxima sai na próxima sessão ou num resend_register de um stream novo",
+      "Registro (tarefa registrar), passo 5: Depois da primeira tentativa de cada sessão nova (qualquer resultado), o registrador chama link.Rotate(gen): é o sinal para o heartbeat trocar de stream se já existir um (H-05).",
+      "Registro (tarefa registrar), passo 6: Volta ao passo 2. As esperas de backoff usam proxy.Sleep(espera, d); ao acordar, se session.Current() tem geração maior que last, o próximo envio já é da sessão nova.",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 1: A tarefa heartbeat (dona do stream) espera link.WaitRegistered(ctx): nada de heartbeat antes do primeiro Register aceito (ou parcial) do processo.",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 2: Abre o stream: sctx, cancel := context.WithCancel(ctx); corev1.NewCoreClient(conn).Heartbeat(sctx, grpc.WaitForReady(true)). Sem teto (FDD 38, L-08); a abertura espera a conexão ficar READY dentro da vida do ctx. Guarda a geração usada (link.Target()) e publica o stream para a tarefa heartbeat_recv com uma época nova.",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 3: Primeiro ping na hora: HeartbeatPing{seq: 1, sent_at: agora UTC}. Depois, um ping por heartbeat_interval, medido a partir do envio anterior, com no máximo um ping sem ack por stream.",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 4: A heartbeat_recv lê os acks do stream publicado. Ack com o seq pendente: marca respondido, observa o tempo de ida e volta, zera o backoff de reabertura no primeiro ack do stream. resend_register = true em qualquer ack: chama registrar.Resend(época) (contrato 3).",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 5: Ack que não chega: a heartbeat dorme AckTimeout = min(heartbeat_interval, 5 s) depois de cada envio; sem ack, cancela o ctx do stream (reason=ack_timeout), o que destrava o SendMsg e o RecvMsg (pedido da FDD 38), e reabre com backoff.",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 6: Fim do stream visto pela heartbeat_recv (erro de RecvMsg, inclusive io.EOF): registra o motivo e acorda a heartbeat, que reabre: io.EOF ou UNAVAILABLE \"controller parando\" com a primeira espera de 0 s; demais códigos com backoff de 1 s a 10 s, multiplicador 1,6, jitter de 20%; UNAUTHENTICATED espera uma sessão nova (link.Target() maior que a geração do stream) antes de reabrir.",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 7: Troca de sessão (link.Rotate(gen) com gen maior que a geração do stream): a heartbeat cancela o stream antigo (reason=rotate) e abre o novo na hora, com o token novo, antes do exp antigo (H-04). Não há dois streams abertos ao mesmo tempo.",
+      "Heartbeat (tarefas heartbeat e heartbeat_recv), passo 8: Cancelamento do ctx (desligamento): o stream é cancelado (reason=shutdown) e as duas tarefas voltam.",
+      "Eventos (tarefa events), passo 1: Espera link.WaitRegistered(ctx) (H-03). Até lá os eventos ficam na proxy.EventQueue do runtime (1.024 itens, descarta o mais antigo).",
+      "Eventos (tarefa events), passo 2: Laço: ev, err := sc.NextEvent(ctx); erro só com o ctx terminado, e a tarefa volta.",
+      "Eventos (tarefa events), passo 3: Converte para EventRequest (contrato 5): id = eventid.Format(nonce, ev.Seq), kind pelo mesmo número, plugin, plugin_instance, detail, occurred_at = ev.At, suppressed = ev.Suppressed.",
+      "Eventos (tarefa events), passo 4: cli.Event(ctx, req, proxy.Buffered()): a visão serializa e põe na fila do core no buffer, devolvendo nil na hora (FDD 38). A entrega é ao menos uma vez, em ordem FIFO, com uma chamada em voo por vez na fila do core.",
+      "Eventos (tarefa events), passo 5: Erro na entrada do buffer (Unavailable com a conexão encerrando, ErrBufferTooLarge, qualquer outro): o evento é perdido, soma em agent_events_total{result=\"failed\"} e log event_buffer_failed amostrado. Nunca bloqueia a tarefa.",
+      "Drenagem e saída (tarefa exit, contrato 7 da FDD 29), passo 1: SIGTERM ou POST /drain: o runtime fecha Draining() e põe drain_start na fila no mesmo instante. A tarefa events envia DRAIN_START pelo buffer; o heartbeat continua; o Exit não sai aqui.",
+      "Drenagem e saída (tarefa exit, contrato 7 da FDD 29), passo 2: Entre o drain_start e o cancelamento passam pelo menos min(3 s, drain_timeout) (FDD 29), tempo em que o DRAIN_START sai com a conexão normal.",
+      "Drenagem e saída (tarefa exit, contrato 7 da FDD 29), passo 3: O stop do canal de controle cancela o ctx das tarefas, com o Envoy vivo e a janela de 2 s aberta (FDD 29, H-03 dela).",
+      "Drenagem e saída (tarefa exit, contrato 7 da FDD 29), passo 4: A tarefa exit acorda com ctx.Done(). Se o processo nunca teve Register aceito, loga exit_skipped e volta (H-10). Senão: reason = \"drain\" se Draining() já fechou, \"sigterm\" se não; ectx, cancel := sc.ExitContext() (1,5 s, marca de segundo plano, conexão viva até ele terminar, FDD 38); cli.Exit(ectx, &corev1.ExitRequest{Reason: reason}) direto, sem Buffered, com o token atual (o interceptor da FDD 39 continua com o estado depois do fim da tarefa session).",
+      "Drenagem e saída (tarefa exit, contrato 7 da FDD 29), passo 5: Log exit_sent (info) com reason, code e duration_ms, ou exit_failed (warn). Sem nova tentativa: é melhor esforço.",
+      "Drenagem e saída (tarefa exit, contrato 7 da FDD 29), passo 6: Ao mesmo tempo, o heartbeat cancela o stream; depois que as tarefas voltam, a conexão esvazia o buffer e fecha (FDD 38)."
+    ],
+    "alternative_flows": [
+      "Controller fora do ar na subida: a session tenta o login com backoff (FDD 39); o registrador fica em Next; heartbeat e eventos esperam o primeiro registro; os eventos se acumulam na fila do runtime. O tráfego segue. Quando o login funciona, Next acorda e o Register sai.",
+      "Queda e volta do controller com a mesma hmac_key: o token continua válido. O stream cai (keepalive ou GOAWAY) e reabre assim que a conexão volta, porque a abertura usa WaitForReady. O primeiro ack traz resend_register; o registrador espera um tempo uniforme em [0, ResendSpread] e reenvia o Register. Os eventos do buffer seguem na ordem; os que chegam antes do novo Register recebem do controller o tratamento pedido no contrato 8.",
+      "Volta do controller sem hmac_key: a primeira chamada recebe UNAUTHENTICATED; a FDD 39 refaz o login; Next acorda com relogin; Register e troca do stream.",
+      "Renovação da sessão (renewed): Register com o token novo, depois link.Rotate; o heartbeat troca de stream na hora. Com a renovação em 80% do TTL, sobra pelo menos 12% do TTL (36 s com o TTL mínimo de 5 min) antes do exp antigo.",
+      "Renovação falhando até a expiração local: a FDD 39 fica sem token; o servidor encerra o stream no ExpiresAt (pedido da FDD 39 à 43); a reabertura recebe UNAVAILABLE \"sessão não estabelecida\" e entra em backoff até haver sessão nova.",
+      "Store do controller degradado: RESOURCE_EXHAUSTED no Register (FDD 41); o heartbeat começa ou continua; o registrador repete com backoff até 60 s; quando o Store sai do degradado, o Register passa.",
+      "Proto de outra major ou campo recusado: FAILED_PRECONDITION é logado com proto_major, proto_minor (os do sidecar) e accepted_major lido do texto da mensagem (-1 se não der para ler); INVALID_ARGUMENT, PERMISSION_DENIED e DATA_LOSS logam o código e o texto do status (que não traz token nem config, FDDs 33 e 36). Nenhum laço de reenvio.",
+      "resend_register repetido: com um Register em voo ou em backoff, o pedido é coalescido; depois de um Register aceito por causa de um pedido, outro pedido do mesmo stream só vale depois de ResendMinGap (30 s); em recusa do conteúdo, vale um pedido por stream.",
+      "Panic numa tarefa do core: a FDD 18 põe panic com task=<nome> na fila e a FDD 06 reinicia a tarefa com espera de 1 s a 60 s. O estado fica nas structs: o registrador refaz o Register da sessão atual; o heartbeat abre um stream novo (o antigo foi cancelado pelo defer); a tarefa events perde no máximo o evento que tinha tirado da fila e ainda não tinha posto no buffer.",
+      "Rajada de panics: a fila do runtime aceita no máximo 1 panic por instância por segundo e soma o resto em Suppressed (FDD 09); o agente não coalesce mais nada. A fila do core no buffer tem pelo menos a metade de max_items (FDD 38). Register e Exit nunca passam pelo buffer, então uma rajada não os descarta.",
+      "Limite de tarefas abaixo de 6 (runtime.plugin_limits[\"n3x.core\"].background.max_tasks): env.Background dá panic com ErrTooManyTasks no New, a instância do core falha e o Envoy não sobe com a mensagem que cita o campo (FDD 06); o validate deve recusar antes (pedido à FDD 15).",
+      "Modo Istio: Draining() não fecha até a FDD 49 ligar a fonte; o Exit sai com sigterm (L-18).",
+      "Validação do bootstrap (N3X_ENVOY_VALIDATE=1): o .so não chama New (FDD 26); nada roda.",
+      "Standalone: agente inativo; NextEvent daria ErrStandalone, mas nenhuma tarefa existe.",
+      "Envoy cria a config do filtro mais de uma vez: a instância core continua única (FDDs 16, 17 e 38); um único agente por processo."
+    ],
+    "diagrams": [
+      "text\n executor (FDD 17) ─ CoreEnv ─▶ agent.New ─▶ effective.Compute (FDD 37), session.Manager (FDD 39)\n                                     │\n                                     ├─ registrar ──── Register (direto) ─────────────┐\n                                     ├─ heartbeat + heartbeat_recv ── stream Heartbeat ┼─▶ conexão (FDD 38) ─▶ host (FDD 33) ─▶ registry (FDD 43)\n                                     ├─ events ◀─ NextEvent ── Event (Buffered) ───────┤\n                                     └─ exit ◀─ ctx cancelado ── Exit (direto) ────────┘",
+      "mermaid\n%% Subida, registro e heartbeat:\nsequenceDiagram\n    participant X as executor (FDD 17)\n    participant A as agent.New\n    participant S as session (FDD 39)\n    participant R as registrar\n    participant H as heartbeat\n    participant E as events\n    participant K as controller (FDD 43)\n    X->>A: Instantiate(\"{}\", CoreEnv)\n    A->>A: effective.Compute (FDD 37), Build do Register, tamanho\n    A->>X: Background: session, registrar, heartbeat, heartbeat_recv, events, exit\n    S->>K: Login (FDD 39)\n    K-->>S: token; geração 1\n    R->>S: Next(ctx, 0)\n    S-->>R: geração 1 (first)\n    R->>K: Register (direto, WaitForReady, teto 5 s)\n    K-->>R: OK com proto_version\n    R->>H: link.SetRegistered(1)\n    H->>K: abre Heartbeat (WaitForReady), ping seq 1\n    K-->>H: ack seq 1\n    E->>E: NextEvent liberado\n    loop a cada heartbeat_interval\n        H->>K: ping seq n\n        K-->>H: ack seq n\n    end",
+      "mermaid\n%% Renovação e troca do stream (sem dois streams abertos):\nsequenceDiagram\n    participant S as session\n    participant R as registrar\n    participant H as heartbeat\n    participant K as controller\n    S-->>R: Next: geração 2 (renewed)\n    R->>K: Register com o token novo\n    K-->>R: OK\n    R->>H: link.Rotate(2)\n    H->>K: cancela o stream da geração 1\n    H->>K: abre o stream com o token da geração 2 e manda ping seq 1\n    K-->>H: ack seq 1",
+      "mermaid\n%% Queda e volta do controller com a mesma chave:\nsequenceDiagram\n    participant H as heartbeat\n    participant R as registrar\n    participant B as buffer (FDD 38)\n    participant K as controller novo\n    Note over H,K: conexão cai; o stream termina com UNAVAILABLE\n    H->>H: reabre com WaitForReady (espera READY)\n    B->>K: eventos guardados, em ordem (podem chegar antes do Register)\n    H->>K: ping seq 1 no stream novo\n    K-->>H: ack com resend_register\n    H->>R: Resend(época)\n    R->>R: espera uniforme em [0, ResendSpread]\n    R->>K: Register\n    K-->>R: OK",
+      "mermaid\n%% Estados da tarefa registrar numa sessão:\nstateDiagram-v2\n    state \"esperando sessão (Next)\" as Wait\n    state \"enviando\" as Send\n    state \"registrado\" as Ok\n    state \"parcial (degradado)\" as Partial\n    state \"backoff\" as Back\n    state \"conteúdo recusado\" as Refused\n    [*] --> Wait\n    Wait --> Send: geração nova\n    Send --> Ok: OK\n    Send --> Partial: RESOURCE_EXHAUSTED\n    Send --> Back: transitório ou UNIMPLEMENTED\n    Send --> Wait: UNAUTHENTICATED\n    Send --> Refused: INVALID_ARGUMENT, PERMISSION_DENIED, DATA_LOSS, FAILED_PRECONDITION\n    Partial --> Send: depois do backoff\n    Back --> Send: fim da espera\n    Ok --> Send: resend_register (com espalhamento)\n    Refused --> Send: resend_register de um stream novo (uma vez)\n    Ok --> Wait: espera a próxima geração\n    Refused --> Wait: geração nova",
+      "mermaid\n%% Saída:\nsequenceDiagram\n    participant D as core/drain (FDD 29)\n    participant E as events\n    participant X as exit\n    participant K as controller\n    D->>D: Draining() fecha; drain_start na fila\n    E->>K: Event DRAIN_START (Buffered); heartbeat segue\n    Note over D: pelo menos min(3 s, T)\n    D->>X: stop: ctx das tarefas cancelado (Envoy vivo)\n    X->>X: reason = drain; ExitContext() com 1,5 s\n    X->>K: Exit(reason=drain), direto, token atual\n    K-->>X: OK"
+    ]
+  },
+  "public_contracts": [
+    {
+      "name": "Contrato 1: agent.New, tarefas e modos",
+      "kind": "sdk",
+      "signature_or_route": "package agent // github.com/giustech/n3x-plugin-core/agent\n\nfunc Plugin() proxy.Plugin { return proxy.Define[types.ProxyConfig](New) }\n\n// New monta o agente. Nunca falha por causa do controller ou da config efetiva;\n// falha só sem proxy.CoreEnv ou por panic de Background (limite de tarefas).\nfunc New(_ types.ProxyConfig, env proxy.Env) (proxy.Instance, error)\n\ntype Mode uint8\n\nconst (\n    ModeInactive     Mode = iota + 1 // \"inactive\": standalone, nenhuma tarefa\n    ModeUnregistered                 // \"unregistered\": só a tarefa session (sem config efetiva ou Register grande demais)\n    ModeActive                       // \"active\": as 6 tarefas\n)\n\nfunc (m Mode) String() string\nfunc (c *Core) Mode() Mode // para testes e logs\n\nconst (\n    TaskSession       = \"session\"        // FDD 39\n    TaskRegistrar     = \"registrar\"\n    TaskHeartbeat     = \"heartbeat\"      // dono do stream: abre, pinga, confere o ack, troca, reabre\n    TaskHeartbeatRecv = \"heartbeat_recv\" // lê os acks do stream atual\n    TaskEvents        = \"events\"\n    TaskExit          = \"exit\"\n    NumTasks          = 6 // cabe no padrão de 8 da FDD 06 (proxy.DefaultMaxTasks)\n)",
+      "request_example": "go\ninst, err := agent.Plugin().Instantiate([]byte(\"{}\"), coreEnv) // feito pelo executor (FDD 17)\ncore := inst.(*agent.Core)",
+      "response_example": {
+        "Logs do New em três sidecars": "text\n{\"ts\":\"2026-10-21T14:00:00.130Z\",\"level\":\"info\",\"component\":\"plugin\",\"service\":\"pedidos\",\"msg\":\"agent_ready\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"mode\":\"active\",\"tasks\":6,\"register_bytes\":21874,\"config_hash\":\"sha256:573ea08dfcea466c12a4eaf03609ef12bc2b3fea4d4d5502b7b8cd7f7077ff3b\",\"heartbeat_interval_ms\":10000}\n{\"ts\":\"2026-10-21T14:00:00.131Z\",\"level\":\"info\",\"component\":\"plugin\",\"service\":\"local\",\"msg\":\"agent_inactive\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"reason\":\"standalone\"}\n{\"ts\":\"2026-10-21T14:00:00.140Z\",\"level\":\"error\",\"component\":\"plugin\",\"service\":\"grande\",\"msg\":\"agent_unregistered\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"reason\":\"register_too_large\",\"tasks\":1}"
+      },
+      "headers_semantics": [
+        "Tipo: sdk (API Go da metade de proxy do core; instância criada só pelo executor)",
+        "Método: n/a (chamada local pelo Instantiate da FDD 17)",
+        "Modos: o modo é decidido no New e não muda no processo. ModeInactive sem controller; ModeUnregistered quando effective.Compute falha ou o Register passa de corev1.MaxRegisterBytes; ModeActive nos demais casos",
+        "Sem config efetiva (pedido da FDD 37, H-11): sem Register não há instância no controller, então heartbeat, eventos e Exit também não saem; a session continua, porque os outros plugins usam o token. O alerta é o da FDD 16 (config_hash=\"\" por 5 min) mais o log agent_unregistered",
+        "Por que 6 tarefas (H-01): o RecvMsg do stream não recebe ctx e a análise estática proíbe a instrução go; com uma tarefa só, o agente não conseguiria esperar o ack com prazo controlado por proxy.Sleep (relógio falso no kit). A heartbeat envia e vigia; a heartbeat_recv só lê. A FDD 09 e a FDD 06 contavam 5 (pedido de ajuste)",
+        "Ordem de registro das tarefas: session primeiro; as demais só em ModeActive. Os nomes casam com ^[a-z][a-z0-9_]{0,31}$ (FDD 06)",
+        "Sem hook: Core não implementa nenhum método de hook; só ConnInterceptors (FDD 39)",
+        "Métricas: criadas no New (FDD 06), só em ModeActive e ModeUnregistered; no ModeInactive nenhuma série agent_* existe"
+      ]
+    },
+    {
+      "name": "Contrato 2: agent/registrar.Build (montagem e teto do Register)",
+      "kind": "sdk",
+      "signature_or_route": "package registrar // github.com/giustech/n3x-plugin-core/agent/registrar\n\ntype Input struct {\n    Identity          proxy.SidecarIdentity // Sidecar().Identity() (FDD 25, contrato 9)\n    Target            string                // env.Target().Name()\n    Manifest          []byte                // Sidecar().Manifest(), bytes exatos (FDD 09)\n    Effective         effconfig.Result      // de effective.Compute, sem recalcular (FDD 37)\n    HeartbeatInterval time.Duration         // ControllerSettings().HeartbeatInterval\n}\n\n// Build monta a mensagem usada em todo Register do processo e devolve o tamanho serializado.\nfunc Build(in Input) (*corev1.RegisterRequest, int, error)\n\ntype SizeError struct {\n    Bytes, Limit, ManifestBytes, ConfigBytes int\n}\n\nfunc (e *SizeError) Error() string\n\nvar (\n    ErrInvalidInput = errors.New(\"registrar: entrada do Register fora dos limites do proto\")\n    ErrTooLarge     = errors.New(\"registrar: Register acima de corev1.MaxRegisterBytes\") // embrulhado com *SizeError\n)\n\n// Teto conferido por teste de constantes (pedido da FDD 22):\n//   effconfig.MaxSize + artifact.MaxManifestSize + 32<<10 <= corev1.MaxRegisterBytes\nconst ReserveBytes = 32 << 10",
+      "request_example": "go\nmsg, size, err := registrar.Build(registrar.Input{\n    Identity:          sc.Identity(),\n    Target:            env.Target().Name(),\n    Manifest:          sc.Manifest(),\n    Effective:         res,\n    HeartbeatInterval: cs.HeartbeatInterval,\n})",
+      "response_example": {
+        "Protojson de msg, bytes encurtados; e o erro de um .so com manifesto de 600 KiB": {
+          "size": 21874,
+          "msg": {
+            "protoVersion": {
+              "major": 1,
+              "minor": 0
+            },
+            "identity": {
+              "service": "pedidos",
+              "instance": "pedidos-7d9f8b-xk2lp",
+              "address": "10.42.3.17:17000"
+            },
+            "target": "envoy-1.40",
+            "envoyVersion": "1.40.1",
+            "manifest": "eyJmb3JtYXQiOjEsInRhcmdldCI6ImVudm95LTEuNDAi...",
+            "config": "eyJmb3JtYXQiOjEsInBsdWdpbnMiOlsuLi5dfQ==",
+            "configHash": "sha256:573ea08dfcea466c12a4eaf03609ef12bc2b3fea4d4d5502b7b8cd7f7077ff3b",
+            "heartbeatInterval": "10s"
+          },
+          "erro do .so grande": "registrar: Register acima de corev1.MaxRegisterBytes: 1139211 bytes (limite 1048576; manifesto 614400, config 524288)",
+          "log": "{\"level\":\"error\",\"component\":\"plugin\",\"msg\":\"register_too_large\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"bytes\":1139211,\"limit\":1048576,\"manifest_bytes\":614400,\"config_bytes\":524288}"
+        }
+      },
+      "headers_semantics": [
+        "Tipo: sdk (função pura do pacote agent/registrar)",
+        "Método: n/a (uma chamada por processo, no New)",
+        "Campos: proto_version = corev1.Version(); identity = {Service, Instance, Address}; target; envoy_version (unknown é válido, FDD 25); manifest; config = Effective.Document; config_hash = Effective.Hash; heartbeat_interval como durationpb",
+        "Limites (FDD 36): serviço de 1 a 63 bytes, instância de 1 a 253, endereço de 1 a 260, alvo de 1 a 32, versão do Envoy de 1 a 64, hash com 71 bytes, intervalo de 1 s a 5 min. A FDD 25 garante a identidade; a conferência aqui é defensiva e falha com ErrInvalidInput (log register_invalid_input com o campo, sem o valor), que leva ao ModeUnregistered com reason=invalid_input",
+        "Imutável: a mensagem é só lida depois do New; todo Register do processo envia os mesmos bytes (mesmo config_hash), o que torna o Register idempotente para o controller",
+        "Custo: uma cópia do manifesto e do documento, até cerca de 1 MiB fora das cotas de memória do plugin (é a mensagem, não um memory.Map)"
+      ],
+      "status_semantics": [
+        "Teto: proto.Size(msg) > corev1.MaxRegisterBytes devolve ErrTooLarge com SizeError; o New loga register_too_large e não envia nada (pedidos das FDDs 22 e 36). Com um manifesto de builder conforme (até 480 KiB) e a config efetiva no teto (512 KiB), a mensagem cabe: o teste monta os dois no máximo com a identidade no tamanho máximo e confere proto.Size abaixo de 1 MiB. Só um .so com manifesto acima de 480 KiB (o leitor aceita até 1 MiB, FDD 22) chega ao register_too_large"
+      ],
+      "limits": {
+        "payload_size": "RegisterRequest serializado até corev1.MaxRegisterBytes (1 MiB); effconfig.MaxSize + artifact.MaxManifestSize + ReserveBytes (32 KiB) <= corev1.MaxRegisterBytes"
+      }
+    },
+    {
+      "name": "Contrato 3: tarefa registrar (gatilhos, códigos e esperas)",
+      "kind": "stream",
+      "signature_or_route": "package registrar\n\ntype Sessions interface { // satisfeita por *session.Manager (FDD 39)\n    Next(ctx context.Context, after uint64) (session.Info, error)\n    Current() (session.Info, bool)\n}\n\ntype Options struct {\n    Conn     grpc.ClientConnInterface // env.Controller()\n    Sessions Sessions\n    Message  *corev1.RegisterRequest  // de Build\n    Link     *link.State\n    Interval time.Duration            // heartbeat_interval, para o ResendSpread\n    Metrics  *telemetry.Metrics\n    Log      *slog.Logger\n    Rand     func() float64           // nil = math/rand/v2 (jitter)\n}\n\nfunc New(o Options) (*Registrar, error)\nfunc (r *Registrar) Run(ctx context.Context)            // tarefa \"registrar\"\nfunc (r *Registrar) Resend(epoch uint64) ResendResult    // chamado pela heartbeat_recv\n\ntype ResendResult uint8\n\nconst (\n    ResendHonored   ResendResult = iota + 1 // \"honored\": vai sair um Register\n    ResendCoalesced                         // \"coalesced\": já há Register em voo, em espera ou em backoff\n    ResendLimited                           // \"limited\": ResendMinGap ou um por stream na recusa\n)\n\nconst (\n    RetryBase       = time.Second      // igual à FDD 39\n    RetryMax        = 60 * time.Second\n    RetryMultiplier = 1.6\n    RetryJitter     = 0.2\n    ProtocolWait    = 60 * time.Second // UNIMPLEMENTED\n    ResendMinGap    = 30 * time.Second // hipótese\n    MaxResendSpread = 5 * time.Second  // ResendSpread = min(Interval/2, MaxResendSpread) (hipótese)\n)",
+      "method": "unary",
+      "request_example": {
+        "Sequência no relógio falso": [
+          {
+            "t": "14:00:01.000",
+            "evento": "Next: geração 1 (first)"
+          },
+          {
+            "t": "14:00:01.002",
+            "Register": "UNAVAILABLE (conexão em TRANSIENT_FAILURE)"
+          },
+          {
+            "t": "14:00:02.010",
+            "Register": "RESOURCE_EXHAUSTED (Store degradado)"
+          },
+          {
+            "t": "14:00:03.640",
+            "Register": "OK"
+          },
+          {
+            "t": "14:12:00.000",
+            "evento": "ack com resend_register (controller reiniciado), época 4"
+          },
+          {
+            "t": "14:12:00.000",
+            "evento": "ack com resend_register de novo, época 4"
+          }
+        ]
+      },
+      "response_example": {
+        "tentativas": [
+          {
+            "t": "14:00:01.002",
+            "result": "unavailable",
+            "proxima_espera": "1s"
+          },
+          {
+            "t": "14:00:02.010",
+            "result": "exhausted",
+            "link": "registrado (parcial)",
+            "proxima_espera": "1,6s"
+          },
+          {
+            "t": "14:00:03.640",
+            "result": "ok"
+          },
+          {
+            "t": "14:12:02.310",
+            "result": "ok",
+            "gatilho": "resend",
+            "espera_espalhada": "2,31s"
+          }
+        ],
+        "Resend": [
+          "honored",
+          "coalesced"
+        ],
+        "n3x_n3x_core_agent_registers_total": {
+          "unavailable": 1,
+          "exhausted": 1,
+          "ok": 2
+        },
+        "log": "{\"level\":\"info\",\"component\":\"plugin\",\"msg\":\"register_sent\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"trigger\":\"session\",\"generation\":1,\"session_kind\":\"first\",\"config_hash\":\"sha256:573ea08dfcea466c12a4eaf03609ef12bc2b3fea4d4d5502b7b8cd7f7077ff3b\",\"bytes\":21874,\"controller_proto\":\"1.0\",\"attempt\":3,\"duration_ms\":4,\"request_id\":\"5b0e1c2d-7a3f-4e19-8c6d-2f4a9b1e7c30\"}"
+      },
+      "headers_semantics": [
+        "Tipo: stream de chamadas unárias /n3x.plugins.n3x.core.v1.Core/Register (cliente) e API Go interna",
+        "Método: Register unário, direto (nunca proxy.Buffered), com grpc.WaitForReady(true) dentro do teto de controller.timeouts.call (5 s) da visão (FDD 38)",
+        "Gatilhos: (1) sessão nova por Next (primeira, renovação e novo login: um Register por geração, pedido da FDD 39); (2) resend_register vindo do heartbeat, com espera uniforme em [0, ResendSpread] (espalha a rajada de 500 sidecars depois de um restart do controller); (3) nova tentativa pela tabela; (4) reinício da tarefa por panic (refaz a geração atual)",
+        "Coalescência: no máximo um Register em voo; Resend durante um envio, uma espera ou um backoff devolve ResendCoalesced; depois de um Register aceito por causa de um Resend, outro Resend do mesmo stream antes de ResendMinGap devolve ResendLimited",
+        "Rotação: depois da primeira tentativa de cada geração nova, qualquer resultado, link.Rotate(gen) (H-05). Assim, quando o Register passa, o controller vê o Register da sessão nova antes do primeiro ping dela; quando falha, a troca do stream não espera mais que o teto da chamada (5 s)",
+        "Esperas: por proxy.Sleep sobre um ctx derivado que o Resend cancela; ao acordar, Current() com geração maior vira o próximo envio. Nenhuma instrução go, nenhum timer fora do proxy.Sleep",
+        "RegisterResponse.proto_version: logado como controller_proto (major.minor); ausente vira controller_proto=\"unknown\" com aviso register_response_invalid (o Register conta como aceito)"
+      ],
+      "status_semantics": [
+        "Código do Register: OK; Classe (result): ok; Ação: link.SetRegistered(gen); espera a próxima sessão ou um resend_register; Log: register_sent (info)",
+        "Código do Register: RESOURCE_EXHAUSTED; Classe (result): exhausted; Ação: registro parcial (H-09): link.SetRegistered(gen, partial); backoff até OK; Log: register_failed (warn, 1 por minuto)",
+        "Código do Register: UNAVAILABLE, DEADLINE_EXCEEDED, ABORTED, INTERNAL, UNKNOWN, NOT_FOUND, ALREADY_EXISTS, OUT_OF_RANGE; Classe (result): unavailable ou error; Ação: backoff de 1 s a 60 s (multiplicador 1,6, jitter de 20%); Log: register_failed (warn, 1 por minuto, com a contagem)",
+        "Código do Register: UNAUTHENTICATED; Classe (result): unauthenticated; Ação: volta para Next; o novo login é da FDD 39; Log: register_failed class=session",
+        "Código do Register: UNIMPLEMENTED; Classe (result): incompatible; Ação: espera ProtocolWait com jitter de 20%; Log: register_rejected (error, 1 por 10 min)",
+        "Código do Register: FAILED_PRECONDITION; Classe (result): incompatible; Ação: recusa do conteúdo; Log: register_rejected com proto_major, proto_minor, accepted_major",
+        "Código do Register: INVALID_ARGUMENT, PERMISSION_DENIED, DATA_LOSS; Classe (result): refused; Ação: recusa do conteúdo; Log: register_rejected com code e detail (texto do status, até 256 bytes)",
+        "Código do Register: CANCELED pelo desligamento; Classe (result): não conta; Ação: fim da tarefa; Log: nenhum",
+        "Recusa do conteúdo: a mensagem é a mesma em todo o processo, então repetir não adianta; a próxima tentativa sai na próxima sessão (renovação em cerca de 48 min com o TTL padrão) ou num resend_register de um stream aberto depois da recusa (o controller pode ter sido trocado), no máximo um por stream",
+        "FAILED_PRECONDITION: accepted_major é lido do texto fixo \"este controller aceita a major <M>\" (FDD 36) por expressão regular; texto diferente dá -1"
+      ],
+      "limits": {
+        "timeout": "teto de controller.timeouts.call (5 s) da visão (FDD 38), com grpc.WaitForReady(true) dentro dele"
+      }
+    },
+    {
+      "name": "Contrato 4: tarefas heartbeat e heartbeat_recv (protocolo do stream)",
+      "kind": "stream",
+      "signature_or_route": "package heartbeat // github.com/giustech/n3x-plugin-core/agent/heartbeat\n\ntype Options struct {\n    Conn     grpc.ClientConnInterface\n    Interval time.Duration                        // controller.heartbeat_interval (1 s a 5 min)\n    Link     *link.State\n    Resend   func(epoch uint64) registrar.ResendResult\n    Metrics  *telemetry.Metrics\n    Log      *slog.Logger\n    Now      func() time.Time                     // nil = time.Now (sent_at)\n    Rand     func() float64\n}\n\nfunc New(o Options) (*Heartbeat, error)\nfunc (h *Heartbeat) RunSender(ctx context.Context)   // tarefa \"heartbeat\"\nfunc (h *Heartbeat) RunReceiver(ctx context.Context) // tarefa \"heartbeat_recv\"\n\nconst (\n    MaxAckTimeout   = 5 * time.Second  // AckTimeout = min(Interval, MaxAckTimeout) (hipótese)\n    ReopenBase      = time.Second\n    ReopenMax       = 10 * time.Second // reabertura mais curta que o login: a abertura já espera o READY (hipótese)\n    ReopenMultiplier = 1.6\n    ReopenJitter    = 0.2\n)",
+      "method": "bidi_stream",
+      "request_example": {
+        "Protojson das mensagens de um stream": [
+          {
+            "enviado": {
+              "seq": 1,
+              "sentAt": "2026-10-21T14:00:03.645Z"
+            }
+          },
+          {
+            "enviado": {
+              "seq": 2,
+              "sentAt": "2026-10-21T14:00:13.645Z"
+            }
+          },
+          {
+            "enviado": {
+              "seq": 3,
+              "sentAt": "2026-10-21T14:00:23.645Z"
+            }
+          }
+        ]
+      },
+      "response_example": {
+        "acks": [
+          {
+            "seq": 1,
+            "resendRegister": false
+          },
+          {
+            "seq": 2,
+            "resendRegister": false
+          },
+          {
+            "seq": 3,
+            "resendRegister": true
+          }
+        ],
+        "efeito do ack 3": "Resend(época 1) = honored; Register em até 5 s",
+        "n3x_n3x_core_agent_heartbeat_rtt_seconds_count": 3,
+        "log (debug)": "{\"level\":\"debug\",\"component\":\"plugin\",\"msg\":\"heartbeat_ack\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"epoch\":1,\"seq\":3,\"rtt_ms\":2,\"resend_register\":true}",
+        "log (queda)": "{\"level\":\"warn\",\"component\":\"plugin\",\"msg\":\"heartbeat_stream_closed\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"epoch\":1,\"reason\":\"unavailable\",\"code\":\"Unavailable\",\"pings\":42,\"lived_ms\":420310,\"next_ms\":0}"
+      },
+      "headers_semantics": [
+        "Tipo: stream bidirecional /n3x.plugins.n3x.core.v1.Core/Heartbeat (cliente)",
+        "Método: Heartbeat com grpc.WaitForReady(true), sem teto (FDD 38, L-08), vida igual à de um ctx próprio por stream",
+        "Quando abre: só depois de link.WaitRegistered (primeiro Register aceito ou parcial do processo). Antes disso o controller não conhece a instância e cada ack pediria resend_register",
+        "Um stream por processo: o core usa 1 dos 2 streams por plugin (FDD 38) e 1 dos 16 por conexão do host (FDD 33). Nenhuma outra parte do core abre stream",
+        "Ping: seq começa em 1 em cada stream e cresce de 1 em 1; sent_at é a hora de parede do sidecar em UTC. Primeiro ping na abertura; depois um por Interval, medido do envio anterior. No máximo um ping sem ack: o próximo só sai depois do ack do anterior",
+        "Ack: esperado com o mesmo seq, na ordem. Ack com seq diferente do pendente é ignorado com log heartbeat_ack_unexpected (warn, 1 por minuto); resend_register = true em qualquer ack chama Resend(época do stream)",
+        "AckTimeout: min(Interval, 5 s) depois de cada envio; sem ack, a heartbeat cancela o ctx do stream (reason=ack_timeout, pedido da FDD 38). O servidor tem 1 s por mensagem (FDD 33) e alvo de 50 ms (HLD)",
+        "Troca na renovação (H-04, pedido da FDD 39): quebra antes de abrir: cancela o stream antigo e abre o novo na hora, com o token da geração alvo. Motivos: não existem duas sessões com ping no mesmo intervalo (a regra de conflito do HLD e do ADR-005 não dispara por renovação), o core continua com 1 stream e o servidor recebe o fim do stream antigo antes da abertura do novo quando os dois estão na mesma conexão HTTP/2 (ordem dos quadros). A lacuna sem stream é de milissegundos, muito abaixo dos 3 intervalos que desconectam",
+        "Backoff: min(10 s, 1 s x 1,6^(n-1)) x (1 + v), v uniforme em [-0,2; +0,2]; o primeiro ack de um stream zera n",
+        "Tarefa heartbeat_recv: espera um stream com época maior que a última lida (canal da link em select com ctx.Done()), lê com RecvMsg até erro, registra o motivo e acorda a heartbeat cancelando o ctx de espera dela. Nunca abre nem fecha stream",
+        "Logs: abertura depois de queda e fim com motivo em info e warn; cada ping e ack só em debug (HLD do core)"
+      ],
+      "status_semantics": [
+        "Reabertura, Fim do stream: io.EOF (servidor encerrou); reason: server_closed; Espera antes de reabrir: 0 s na primeira, depois backoff",
+        "Reabertura, Fim do stream: UNAVAILABLE (inclusive \"controller parando\" e conexão perdida); reason: unavailable; Espera antes de reabrir: 0 s na primeira, depois backoff; a abertura espera o READY",
+        "Reabertura, Fim do stream: UNAUTHENTICATED; reason: rejected; Espera antes de reabrir: espera geração nova em link.Target()",
+        "Reabertura, Fim do stream: RESOURCE_EXHAUSTED (17º stream no servidor); reason: exhausted; Espera antes de reabrir: backoff",
+        "Reabertura, Fim do stream: PERMISSION_DENIED, INVALID_ARGUMENT, FAILED_PRECONDITION, UNIMPLEMENTED; reason: refused; Espera antes de reabrir: ReopenMax fixo (10 s), log heartbeat_rejected (error, 1 por 10 min)",
+        "Reabertura, Fim do stream: sem ack no prazo; reason: ack_timeout; Espera antes de reabrir: backoff",
+        "Reabertura, Fim do stream: troca de sessão; reason: rotate; Espera antes de reabrir: 0 s",
+        "Reabertura, Fim do stream: ctx cancelado; reason: shutdown; Espera antes de reabrir: não reabre",
+        "Sem teto e sem Buffered: Heartbeat(ctx, proxy.Buffered()) daria ErrBufferedStream (FDD 38); o agente nunca passa a opção"
+      ],
+      "limits": {
+        "timeout": "stream sem teto (FDD 38, L-08); AckTimeout = min(Interval, 5 s) depois de cada ping"
+      }
+    },
+    {
+      "name": "Contrato 5: tarefa events e o ID de idempotência",
+      "kind": "queue",
+      "signature_or_route": "package eventid // github.com/giustech/n3x-plugin-core/internal/eventid (agent e controller)\n\nconst Len = 33 // 16 hex, \":\", 16 hex\n\n// Format devolve \"<nonce em 16 hex>:<seq em 16 hex>\", minúsculo e de largura fixa.\nfunc Format(nonce [8]byte, seq uint64) string\n// Parse aceita só a forma de Format; seq 0 é inválido.\nfunc Parse(id string) (nonce [8]byte, seq uint64, err error)\n\nvar ErrFormat = errors.New(\"eventid: id fora do formato\")\n\npackage events // github.com/giustech/n3x-plugin-core/agent/events\n\ntype Options struct {\n    Conn    grpc.ClientConnInterface\n    Sidecar proxy.Sidecar // NextEvent\n    Link    *link.State\n    Nonce   [8]byte       // crypto/rand no New; um por processo\n    Metrics *telemetry.Metrics\n    Log     *slog.Logger\n}\n\nfunc New(o Options) (*Events, error)\nfunc (e *Events) Run(ctx context.Context) // tarefa \"events\"\n\n// ToProto converte um proxy.Event (FDD 09) no EventRequest (FDD 36). Pura.\nfunc ToProto(ev proxy.Event, nonce [8]byte) *corev1.EventRequest",
+      "method": "unary",
+      "request_example": {
+        "O que a tarefa lê com NextEvent": [
+          {
+            "Seq": 41,
+            "Kind": "panic",
+            "Plugin": "giustech.ratelimit",
+            "Instance": "rl-api",
+            "Detail": "hook=request_headers",
+            "At": "2026-10-21T14:00:03.120Z",
+            "Suppressed": 0
+          },
+          {
+            "Seq": 42,
+            "Kind": "panic",
+            "Plugin": "giustech.ratelimit",
+            "Instance": "rl-api",
+            "Detail": "hook=request_headers",
+            "At": "2026-10-21T14:00:04.130Z",
+            "Suppressed": 9
+          },
+          {
+            "Seq": 43,
+            "Kind": "drain_start",
+            "Plugin": "",
+            "Instance": "",
+            "Detail": "drain_timeout=20s",
+            "At": "2026-10-21T15:00:00.004Z"
+          }
+        ]
+      },
+      "response_example": {
+        "Protojson enviado pelo buffer, nonce 4f1c2e9a7b3d5c60": [
+          {
+            "id": "4f1c2e9a7b3d5c60:0000000000000029",
+            "kind": "EVENT_KIND_PANIC",
+            "plugin": "giustech.ratelimit",
+            "pluginInstance": "rl-api",
+            "detail": "hook=request_headers",
+            "occurredAt": "2026-10-21T14:00:03.120Z"
+          },
+          {
+            "id": "4f1c2e9a7b3d5c60:000000000000002a",
+            "kind": "EVENT_KIND_PANIC",
+            "plugin": "giustech.ratelimit",
+            "pluginInstance": "rl-api",
+            "detail": "hook=request_headers",
+            "occurredAt": "2026-10-21T14:00:04.130Z",
+            "suppressed": 9
+          },
+          {
+            "id": "4f1c2e9a7b3d5c60:000000000000002b",
+            "kind": "EVENT_KIND_DRAIN_START",
+            "detail": "drain_timeout=20s",
+            "occurredAt": "2026-10-21T15:00:00.004Z"
+          }
+        ]
+      },
+      "headers_semantics": [
+        "Tipo: queue (consumo de proxy.EventQueue por Sidecar().NextEvent) e chamada unária /n3x.plugins.n3x.core.v1.Core/Event pelo buffer",
+        "Método: Event unário com proxy.Buffered() (pedido das FDDs 29 e 38)",
+        "ID (pedido da FDD 09, H-02): nonce:seq com o nonce aleatório de 8 bytes do processo e o Seq da fila do runtime. Único entre restarts (processo novo, nonce novo; colisão com probabilidade de 2^-64 por par de processos) e entre réplicas; casa com a regra da FDD 36 ([A-Za-z0-9._:-], até 64 bytes). A largura fixa deixa a ordem de texto igual à ordem de seq dentro do mesmo nonce. Não usa UUID nem ULID porque o Seq já é a ordem e o nonce já é a origem",
+        "Conversão (pedidos das FDDs 18 e 36), proxy.Event: Seq; EventRequest: id; Regra: eventid.Format(nonce, Seq)",
+        "Conversão (pedidos das FDDs 18 e 36), proxy.Event: Kind; EventRequest: kind; Regra: mesmo número (EventPanic 1 vira EVENT_KIND_PANIC 1, até EventSecretInClear 6); valor fora de 1 a 6 sai com o número, e o controller trata como unknown",
+        "Conversão (pedidos das FDDs 18 e 36), proxy.Event: Plugin; EventRequest: plugin; Regra: Plugin.String(); vazio em drain_start e em eventos do processo (controller.secret em claro)",
+        "Conversão (pedidos das FDDs 18 e 36), proxy.Event: Instance; EventRequest: plugin_instance; Regra: como veio; vazio quando não se aplica",
+        "Conversão (pedidos das FDDs 18 e 36), proxy.Event: Detail; EventRequest: detail; Regra: como veio (já saneado e cortado em 256 bytes pela fila; corev1.MaxEventDetailLen == proxy.MaxEventDetail conferido por teste)",
+        "Conversão (pedidos das FDDs 18 e 36), proxy.Event: At; EventRequest: occurred_at; Regra: timestamppb.New(At), UTC",
+        "Conversão (pedidos das FDDs 18 e 36), proxy.Event: Suppressed; EventRequest: suppressed; Regra: panics da mesma instância suprimidos desde o último aceito (só em panic)",
+        "Conversão (pedidos das FDDs 18 e 36), Acontecimento: panic de hook, do Go() ou de tarefa; Kind: panic; Produtor: FDD 18; Detail: hook=<nome> ou task=<nome>, com suppressed",
+        "Conversão (pedidos das FDDs 18 e 36), Acontecimento: disjuntor aberto por panics ou por zumbis; Kind: breaker_open; Produtor: FDD 18; Detail: reason=panics ou reason=zombies",
+        "Conversão (pedidos das FDDs 18 e 36), Acontecimento: última instância com fase do plugin aberta; Kind: plugin_disabled; Produtor: FDD 18; Detail: reason=breaker instances=<n>",
+        "Conversão (pedidos das FDDs 18 e 36), Acontecimento: aviso não fatal da config na subida; Kind: config_error; Produtor: FDD 17; Detail: <caminho> [<código>]",
+        "Conversão (pedidos das FDDs 18 e 36), Acontecimento: segredo sem ENC[...]; Kind: secret_in_clear; Produtor: FDD 17; Detail: plugins[1].config.tokens[0] ou controller.secret",
+        "Conversão (pedidos das FDDs 18 e 36), Acontecimento: início da drenagem; Kind: drain_start; Produtor: FDD 29; Detail: drain_timeout=<duração>",
+        "Quando consome: só depois do primeiro registro do processo (H-03); até lá a fila do runtime guarda até 1.024 eventos e descarta o mais antigo (contado pela FDD 09). Assim nenhum Event de um processo chega antes do primeiro Register aceito dele",
+        "Sem coalescência própria: a fila já amostra panic em 1 por instância por segundo com Suppressed; os outros tipos são raros e saem um a um",
+        "Entrega: ao menos uma vez, FIFO na fila do core do buffer, uma chamada em voo; código transitório deixa o item e espera de 1 s a 10 s; código definitivo (por exemplo INVALID_ARGUMENT) tira o item com controller_buffer_failed (FDD 38). O agente não vê o resultado"
+      ],
+      "status_semantics": [
+        "Falha na entrada do buffer: Unavailable (conexão encerrando), ErrBufferTooLarge (impossível com 256 bytes de detalhe) ou outro: o evento é perdido, agent_events_total{result=\"failed\"}, log event_buffer_failed (warn, 1 por minuto)"
+      ],
+      "limits": {
+        "payload_size": "id até 64 bytes (regra da FDD 36); detail cortado em 256 bytes pela fila"
+      }
+    },
+    {
+      "name": "Contrato 6: tarefa exit",
+      "kind": "method",
+      "signature_or_route": "package exit // github.com/giustech/n3x-plugin-core/agent/exit\n\ntype Options struct {\n    Conn    grpc.ClientConnInterface\n    Sidecar proxy.Sidecar // Draining e ExitContext\n    Link    *link.State\n    Metrics *telemetry.Metrics\n    Log     *slog.Logger\n}\n\nfunc New(o Options) (*Exit, error)\nfunc (x *Exit) Run(ctx context.Context) // tarefa \"exit\": espera ctx.Done() e envia\n\n// Reason devolve corev1.ExitReasonDrain se draining já fechou, senão corev1.ExitReasonSigterm.\nfunc Reason(draining <-chan struct{}) string",
+      "method": "unary",
+      "request_example": "go\n// dentro de (*Exit).Run, depois de <-ctx.Done() e com o processo já registrado\nectx, cancel := x.sc.ExitContext()\ndefer cancel()\n_, err := x.cli.Exit(ectx, &corev1.ExitRequest{Reason: exit.Reason(x.sc.Draining())})",
+      "response_example": {
+        "Logs de três paradas": "text\n{\"ts\":\"2026-10-21T15:00:03.051Z\",\"level\":\"info\",\"component\":\"plugin\",\"service\":\"pedidos\",\"msg\":\"exit_sent\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"reason\":\"drain\",\"code\":\"OK\",\"duration_ms\":39}\n{\"ts\":\"2026-10-21T15:10:00.012Z\",\"level\":\"warn\",\"component\":\"plugin\",\"service\":\"pedidos\",\"msg\":\"exit_failed\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"reason\":\"sigterm\",\"code\":\"DeadlineExceeded\",\"duration_ms\":1500}\n{\"ts\":\"2026-10-21T15:20:00.002Z\",\"level\":\"info\",\"component\":\"plugin\",\"service\":\"pedidos\",\"msg\":\"exit_skipped\",\"plugin_id\":\"n3x.core\",\"instance\":\"core\",\"reason\":\"not_registered\"}"
+      },
+      "headers_semantics": [
+        "Tipo: chamada unária /n3x.plugins.n3x.core.v1.Core/Exit (cliente)",
+        "Método: Exit unário, direto, com o ctx de Sidecar().ExitContext() (prazo de proxy.ExitTimeout, 1,5 s; marca de segundo plano; conexão viva até ele terminar, FDDs 09 e 38)",
+        "Momento (pedido da FDD 29): só no cancelamento do ctx das tarefas, causado pelo stop do canal de controle, com o Envoy vivo; nunca no início da drenagem",
+        "reason: texto drain ou sigterm (corev1.ExitReasonDrain e corev1.ExitReasonSigterm, FDD 36); drain quando Draining() fechou antes, inclusive pelo POST /drain da aplicação",
+        "Só depois de registrar (H-10): se o processo nunca teve Register aceito ou parcial, não envia (exit_skipped, result=\"skipped\"); um Exit de um processo que o controller nunca viu não marca nada e poderia afetar outro processo com a mesma identidade",
+        "Uma vez por processo; sem nova tentativa; qualquer erro só vira log e métrica",
+        "Ordem com o resto: o heartbeat cancela o stream no mesmo instante; os eventos que ainda estão no buffer são esvaziados depois do Exit (a conexão espera as saídas abertas antes de esvaziar, FDD 38), então podem chegar ao controller depois do Exit (contrato 8)"
+      ],
+      "status_semantics": [
+        "Token: o atual, anexado pelo interceptor da FDD 39 (o estado sobrevive ao fim da tarefa session); sem token, UNAVAILABLE na hora e exit_failed"
+      ],
+      "limits": {
+        "timeout": "proxy.ExitTimeout, 1,5 s, pelo ctx de Sidecar().ExitContext()"
+      }
+    },
+    {
+      "name": "Contrato 7: coordenação interna (agent/internal/link)",
+      "kind": "sdk",
+      "signature_or_route": "package link // github.com/giustech/n3x-plugin-core/agent/internal/link\n\ntype State struct{ /* atômicos e um canal de mudança trocado a cada alteração */ }\n\nfunc New() *State\nfunc (s *State) SetRegistered(gen uint64, partial bool) // registrar\nfunc (s *State) RegisteredOnce() bool\nfunc (s *State) WaitRegistered(ctx context.Context) error // heartbeat e events\nfunc (s *State) Rotate(gen uint64)                       // registrar: geração que o heartbeat deve usar\nfunc (s *State) Target() uint64\nfunc (s *State) Changed() <-chan struct{}                // fechado a cada mudança; sempre em select com ctx.Done()",
+      "request_example": "go\nl := link.New()\nl.SetRegistered(1, false)\nl.Rotate(2)",
+      "response_example": {
+        "RegisteredOnce": true,
+        "Target": 2,
+        "Changed": "fechado duas vezes; o heartbeat acorda e troca o stream da geração 1 para a 2"
+      },
+      "headers_semantics": [
+        "Tipo: sdk (pacote interno do agente; hipótese de nome e de forma, H-15)",
+        "Nada de I/O, log ou métrica; só estado compartilhado entre as tarefas, seguro entre goroutines",
+        "RegisteredOnce nunca volta a falso no processo (a queda do controller não desfaz o \"já registrei uma vez\"; quem refaz o registro no controller novo é o resend_register)",
+        "Target só cresce; o heartbeat compara com a geração do stream aberto",
+        "Nenhum context.Context em campo (regra ctx_field, FDD 24): os ctx de espera são criados nas próprias tarefas e só as funções de cancelamento ficam guardadas"
+      ]
+    },
+    {
+      "name": "Contrato 8: o que o controller recebe (contrato de mensagens para a FDD 43)",
+      "kind": "stream",
+      "signature_or_route": "Core/Register, Core/Heartbeat, Core/Event e Core/Exit, todas com authorization (sessão da FDD 39) e x-request-id",
+      "request_example": {
+        "O que o controller recebe de um processo, em ordem de chegada, com o controller reiniciado no meio": [
+          {
+            "rpc": "Register",
+            "nonce_sessao": "Qk9...22",
+            "config_hash": "sha256:573e...ff3b"
+          },
+          {
+            "rpc": "Heartbeat",
+            "stream": 1,
+            "nonce_sessao": "Qk9...22",
+            "pings": "seq 1..42"
+          },
+          {
+            "rpc": "Event",
+            "id": "4f1c2e9a7b3d5c60:0000000000000029"
+          },
+          {
+            "rpc": "Event",
+            "id": "4f1c2e9a7b3d5c60:0000000000000029",
+            "nota": "repetição imediata (resposta perdida)"
+          },
+          {
+            "controller": "reinicia com a mesma hmac_key"
+          },
+          {
+            "rpc": "Event",
+            "id": "4f1c2e9a7b3d5c60:000000000000002a",
+            "nota": "antes do Register (G8)"
+          },
+          {
+            "rpc": "Heartbeat",
+            "stream": 2,
+            "nonce_sessao": "Qk9...22",
+            "pings": "seq 1"
+          },
+          {
+            "rpc": "Register",
+            "gatilho": "resend_register"
+          },
+          {
+            "rpc": "Exit",
+            "reason": "drain"
+          },
+          {
+            "rpc": "Event",
+            "id": "4f1c2e9a7b3d5c60:000000000000002b",
+            "kind": "EVENT_KIND_CONFIG_ERROR",
+            "nota": "esvaziado do buffer depois do Exit"
+          }
+        ]
+      },
+      "response_example": {
+        "O esperado do controller": [
+          {
+            "rpc": "Register",
+            "status": "OK"
+          },
+          {
+            "rpc": "Heartbeat",
+            "acks": "seq 1..42, resend_register false"
+          },
+          {
+            "rpc": "Event",
+            "id": "...0029",
+            "status": "OK",
+            "guardado": true
+          },
+          {
+            "rpc": "Event",
+            "id": "...0029",
+            "status": "OK",
+            "guardado": false,
+            "motivo": "seq <= último do nonce"
+          },
+          {
+            "rpc": "Event",
+            "id": "...002a",
+            "status": "ABORTED",
+            "efeito no sidecar": "item fica no buffer e repete em 1 s"
+          },
+          {
+            "rpc": "Heartbeat",
+            "ack": {
+              "seq": 1,
+              "resend_register": true
+            }
+          },
+          {
+            "rpc": "Register",
+            "status": "OK",
+            "depois": "Event ...002a aceito na repetição"
+          },
+          {
+            "rpc": "Exit",
+            "status": "OK",
+            "estado": "desconectado"
+          },
+          {
+            "rpc": "Event",
+            "id": "...002b",
+            "status": "OK",
+            "estado": "continua desconectado"
+          }
+        ]
+      },
+      "headers_semantics": [
+        "Tipo: stream e chamadas gRPC do serviço n3x.plugins.n3x.core.v1.Core, do ponto de vista do servidor",
+        "Método: o que um processo do sidecar garante e o que espera do controller",
+        "Garantia do agente (por processo do .so), G1: Nada do serviço Core sai antes do primeiro Register aceito ou parcial do processo, salvo depois de o controller perder o estado (G8)",
+        "Garantia do agente (por processo do .so), G2: Todo Register do processo tem os mesmos bytes de manifest e config e o mesmo config_hash; muda só o token (nonce da sessão). Um Register por sessão nova (primeira, renovação, novo login), mais os pedidos por resend_register e as novas tentativas",
+        "Garantia do agente (por processo do .so), G3: No máximo um stream de heartbeat aberto. Na troca de sessão, o stream antigo é cancelado antes de o novo abrir, e o primeiro ping da sessão nova vem depois do Register dela quando ele é aceito",
+        "Garantia do agente (por processo do .so), G4: Em cada stream, seq começa em 1 e cresce de 1 em 1, com no máximo um ping sem ack; o próximo ping só sai depois do ack do anterior (ou o stream é cancelado)",
+        "Garantia do agente (por processo do .so), G5: Event.id = <nonce do processo>:<seq> em largura fixa; o nonce é o mesmo em todos os eventos do processo e diferente entre processos",
+        "Garantia do agente (por processo do .so), G6: Dentro do mesmo nonce, os eventos chegam em ordem não decrescente de seq: a fila do core no buffer é FIFO com uma chamada em voo, então uma repetição (entrega ao menos uma vez) é sempre o mesmo item reenviado logo em seguida. Pode haver lacunas de seq (descarte na fila do runtime ou no buffer)",
+        "Garantia do agente (por processo do .so), G7: Exit no máximo uma vez por processo, só depois de um registro, com o token da sessão atual. Eventos do buffer podem chegar depois dele",
+        "Garantia do agente (por processo do .so), G8: Depois de um restart do controller com a mesma chave, eventos do buffer e o heartbeat reaberto podem chegar antes do Register pedido pelo resend_register",
+        "Garantia do agente (por processo do .so), G9: Identidade do Register igual à do token (as duas vêm de Sidecar().Identity()); heartbeat_interval igual ao do n3x.yaml",
+        "O que o agente espera do controller (pedido à FDD 43), E1: Um HeartbeatAck por ping, com o mesmo seq, em até 1 s; resend_register = true quando a instância não é conhecida (ou só tem registro parcial sem config), e falso nos demais casos",
+        "O que o agente espera do controller (pedido à FDD 43), E3: Deduplicação por último seq por nonce (G5 e G6): seq menor ou igual ao último aceito daquele nonce é repetido; memória O(1) por nonce, com alguns nonces recentes por instância (proposta para a L-65)",
+        "O que o agente espera do controller (pedido à FDD 43), E4: Renovação não é conflito: um processo nunca tem dois streams abertos (G3); conflito de identidade = dois streams abertos ao mesmo tempo com nonces de sessão diferentes, os dois com ping no mesmo intervalo, por pelo menos 2 intervalos (pedido da FDD 39)",
+        "O que o agente espera do controller (pedido à FDD 43), E5: Exit vale para a sessão do token: se a instância já tem uma sessão mais nova de outro processo com ping, o Exit da antiga não desconecta a nova; Event depois do Exit não revive a instância (pedido da FDD 38)",
+        "O que o agente espera do controller (pedido à FDD 43), E7: Register repetido com o mesmo config_hash é idempotente (upsert sem duplicar); o stream de heartbeat é encerrado no ExpiresAt da sessão (pedido da FDD 39)"
+      ],
+      "status_semantics": [
+        "O que o agente espera do controller (pedido à FDD 43), E2: Event de instância sem Register vigente responde ABORTED (código transitório do buffer, FDD 38), para o item esperar o Register sem ser descartado (hipótese H-16); a alternativa de guardar o evento órfão fica com a FDD 43",
+        "O que o agente espera do controller (pedido à FDD 43), E6: RESOURCE_EXHAUSTED no Register só por config nova recusada pelo Store degradado, com a instância e a sessão já gravadas (registro parcial, H-09); outros recursos esgotados (limite de conexões do host) chegam pela FDD 33 e o agente trata igual",
+        "O que o agente espera do controller (pedido à FDD 43), E8: Status de recusa sem token, segredo ou trecho de config no texto (FDDs 33 e 36), porque o agente loga o texto em register_rejected"
+      ]
+    },
+    {
+      "name": "Contrato 9: kit de teste do agente (agent/agenttest)",
+      "kind": "sdk",
+      "signature_or_route": "package agenttest // github.com/giustech/n3x-plugin-core/agent/agenttest\n\n// FakeCore é um corev1.CoreServer programável que grava tudo e deduplica eventos por id.\ntype FakeCore struct{ /* ... */ }\n\nfunc NewFakeCore() *FakeCore\nfunc (f *FakeCore) Script(method string, codes ...codes.Code) // próximas respostas daquele RPC\nfunc (f *FakeCore) ResendOnNextAck()\nfunc (f *FakeCore) HoldAcks(hold bool)                         // para o ack_timeout\nfunc (f *FakeCore) Registers() []Recorded\nfunc (f *FakeCore) Streams() []StreamRecord                    // nonce da sessão, pings, abertura e fim\nfunc (f *FakeCore) Events() []*corev1.EventRequest             // únicos, na ordem de chegada\nfunc (f *FakeCore) Duplicates() int\nfunc (f *FakeCore) Exits() []Recorded\n\n// ControllerPlugin devolve a metade de controller do core (login e Authenticate reais, FDD 39)\n// com o serviço Core trocado pelo FakeCore, para ctrltest.NewHost.\nfunc ControllerPlugin(f *FakeCore) ctrl.Plugin",
+      "request_example": {
+        "Vetor do panic de ponta a ponta, pedido da FDD 12": "go\nfunc TestPanicDePontaAPonta(t *testing.T) {\n    f := agenttest.NewFakeCore()\n    h := ctrltest.NewHost(t, agenttest.ControllerPlugin(f), `{}`)\n    p := sdktest.NewProxy(t, agent.Plugin(), `{}`, sdktest.AsCore(),\n        sdktest.Service(\"pedidos\"), ctrltest.Link(h, ctrltest.As(ctrltest.Sidecar(\"pedidos\", \"pedidos-0\"))))\n    p.Scheduler().Settle() // login, Register e primeiro ping\n    p.PushEvent(proxy.Event{Kind: proxy.EventPanic, Plugin: rl, Instance: \"rl-api\", Detail: \"hook=request_headers\"})\n    p.Scheduler().Advance(100 * time.Millisecond)\n    if got := f.Events(); len(got) != 1 { t.Fatalf(\"eventos = %d\", len(got)) }\n}"
+      },
+      "response_example": {
+        "f.Registers()": 1,
+        "f.Events()": [
+          {
+            "id": "<nonce>:0000000000000001",
+            "kind": "EVENT_KIND_PANIC",
+            "plugin": "giustech.ratelimit",
+            "pluginInstance": "rl-api",
+            "detail": "hook=request_headers"
+          }
+        ],
+        "f.Duplicates()": 0,
+        "goroutines opacas": 0
+      },
+      "headers_semantics": [
+        "Tipo: sdk (API Go só de teste, no repositório n3x-plugin-core; hipótese de forma, H-14)",
+        "Método: n/a (usado com ctrltest.NewHost, ctrltest.Link e sdktest.NewProxy das FDDs 07 e 12)",
+        "Até a FDD 43 existir, os critérios desta FDD rodam contra o FakeCore; depois, os mesmos testes rodam também contra o registry real",
+        "A troca do servidor Core é feita por um gancho em internal/ do repositório (fora da API pública); nenhum código de produção lê o gancho",
+        "O relógio é o do agendador compartilhado (ctrltest.Link), inclusive proxy.Sleep, ExitContext e o prazo da visão"
+      ]
+    }
+  ],
+  "errors_exceptions_fallback": {
+    "error_matrix": [
+      {
+        "condition": "New sem proxy.CoreEnv",
+        "treatment": "Erro; o Envoy não sobe",
+        "notes": "Runtime errado (FDD 36)"
+      },
+      {
+        "condition": "Standalone",
+        "treatment": "ModeInactive, nenhuma tarefa",
+        "notes": "Log agent_inactive"
+      },
+      {
+        "condition": "effective.Compute falha",
+        "treatment": "ModeUnregistered; só a session",
+        "notes": "Pedido da FDD 37; alerta da FDD 16"
+      },
+      {
+        "condition": "Identidade fora dos limites (defensivo)",
+        "treatment": "ModeUnregistered, register_invalid_input",
+        "notes": "A FDD 25 garante que não acontece"
+      },
+      {
+        "condition": "Register acima de 1 MiB",
+        "treatment": "ModeUnregistered, register_too_large",
+        "notes": "Só com manifesto acima de 480 KiB"
+      },
+      {
+        "condition": "max_tasks do core abaixo de 6",
+        "treatment": "Panic ErrTooManyTasks no New; o Envoy não sobe",
+        "notes": "Pedido à FDD 15 para recusar no validate"
+      },
+      {
+        "condition": "Register UNAVAILABLE, DEADLINE_EXCEEDED, ABORTED, INTERNAL, outros transitórios",
+        "treatment": "Backoff de 1 s a 60 s",
+        "notes": "Contrato 3"
+      },
+      {
+        "condition": "Register RESOURCE_EXHAUSTED",
+        "treatment": "Registro parcial; heartbeat segue; backoff até OK",
+        "notes": "Pedido da FDD 41; H-09"
+      },
+      {
+        "condition": "Register UNAUTHENTICATED",
+        "treatment": "Espera a sessão nova (FDD 39)",
+        "notes": "Um Register por geração"
+      },
+      {
+        "condition": "Register UNIMPLEMENTED",
+        "treatment": "60 s com jitter",
+        "notes": "Controller com o core mínimo"
+      },
+      {
+        "condition": "Register FAILED_PRECONDITION",
+        "treatment": "Recusa do conteúdo; log com proto_major, proto_minor, accepted_major",
+        "notes": "Pedido da FDD 36"
+      },
+      {
+        "condition": "Register INVALID_ARGUMENT, PERMISSION_DENIED, DATA_LOSS",
+        "treatment": "Recusa do conteúdo até a próxima sessão ou um resend_register de stream novo",
+        "notes": "FR-016: \"o sidecar loga o motivo\""
+      },
+      {
+        "condition": "RegisterResponse sem proto_version",
+        "treatment": "Aceito; register_response_invalid"
+      },
+      {
+        "condition": "resend_register em rajada",
+        "treatment": "Coalescido; ResendMinGap de 30 s; espalhamento de até 5 s",
+        "notes": "Contrato 3"
+      },
+      {
+        "condition": "Heartbeat sem ack em AckTimeout",
+        "treatment": "Cancela o ctx do stream; reabre com backoff",
+        "notes": "Pedido da FDD 38"
+      },
+      {
+        "condition": "Fim do stream (EOF, UNAVAILABLE)",
+        "treatment": "Reabre com WaitForReady; primeira espera 0 s",
+        "notes": "Volta rápida ao painel"
+      },
+      {
+        "condition": "Heartbeat UNAUTHENTICATED",
+        "treatment": "Espera sessão nova e reabre",
+        "notes": "FDD 39 refaz o login"
+      },
+      {
+        "condition": "Heartbeat RESOURCE_EXHAUSTED",
+        "treatment": "Backoff até 10 s",
+        "notes": "17º stream no servidor (FDD 33)"
+      },
+      {
+        "condition": "Heartbeat recusado (PERMISSION_DENIED, INVALID_ARGUMENT, FAILED_PRECONDITION, UNIMPLEMENTED)",
+        "treatment": "10 s fixos; heartbeat_rejected"
+      },
+      {
+        "condition": "Ack com seq inesperado",
+        "treatment": "Ignorado; heartbeat_ack_unexpected"
+      },
+      {
+        "condition": "Entrada no buffer falha",
+        "treatment": "Evento perdido; event_buffer_failed",
+        "notes": "Raro: conexão encerrando"
+      },
+      {
+        "condition": "Controller descarta um evento com código definitivo",
+        "treatment": "Item sai do buffer (controller_buffer_failed, FDD 38)",
+        "notes": "O agente não vê"
+      },
+      {
+        "condition": "Fila do runtime cheia antes do primeiro registro",
+        "treatment": "Descarta o mais antigo; n3x_sidecar_events_dropped_total",
+        "notes": "FDD 09"
+      },
+      {
+        "condition": "Exit sem registro no processo",
+        "treatment": "Não envia; exit_skipped",
+        "notes": "H-10"
+      },
+      {
+        "condition": "Exit falha ou passa de 1,5 s",
+        "treatment": "exit_failed; sem nova tentativa",
+        "notes": "Melhor esforço"
+      },
+      {
+        "condition": "Panic numa tarefa do core",
+        "treatment": "Contido e reiniciado pela FDD 06; evento panic task=<nome>",
+        "notes": "Estado nas structs"
+      }
+    ],
+    "resilience_strategies": [
+      "Timeouts: unárias com o teto da visão (5 s, FDD 38) e WaitForReady dentro dele; Exit com 1,5 s do ExitContext; stream sem teto, vigiado pelo AckTimeout (até 5 s) e pelo keepalive da conexão (30 s mais 10 s)",
+      "Retries: Register com backoff exponencial de 1 s a 60 s (1,6, 20% de jitter), espera de 60 s para UNIMPLEMENTED, nenhuma repetição para recusa do conteúdo; heartbeat com reabertura de 0 s na primeira e backoff até 10 s; eventos com as tentativas do buffer (1 s a 10 s, FDD 38); Exit sem repetição",
+      "Backoff e jitter: espalhamento uniforme de até 5 s nos Register pedidos por resend_register, para 500 sidecars não reenviarem juntos depois de um restart do controller",
+      "Circuit breaker: não há disjuntor próprio; a recusa do conteúdo funciona como corte (para de reenviar a mesma mensagem recusada)"
+    ],
+    "fallback_policy": "- O tráfego nunca depende do agente: nenhuma falha do controller, da sessão ou da config efetiva derruba o Envoy; só a falta de CoreEnv e o limite de tarefas abaixo de 6 impedem a subida, e os dois são erro de montagem ou de config\n- Sem config efetiva, o sidecar some do painel (não manda Register incompleto), mas continua servindo e com a sessão para os outros plugins\n- Eventos são sinal, não contagem: a perda por capacidade é medida e aceita; as contagens exatas ficam nas métricas do sidecar (FDD 18)",
+    "invariants": [
+      "Nenhum hook na instância core; nenhuma instrução go; nenhuma espera fora de proxy.Sleep, select com ctx.Done() ou chamada gRPC com ctx",
+      "No máximo 6 tarefas, 1 stream de heartbeat e 1 Register em voo por processo",
+      "Register e Exit nunca passam pelo buffer; Event sempre passa",
+      "Todo Register do processo tem o mesmo config_hash e é feito com o Result calculado uma vez no New",
+      "Event.id único no processo e entre processos (com a probabilidade do nonce de 64 bits)",
+      "Exit no máximo uma vez, só depois de um registro",
+      "Nenhum token, segredo, nonce de sessão ou config sem máscara em log, métrica ou evento"
+    ]
+  },
+  "observability": {
+    "metrics": [
+      "Registradas pelo env.Metrics() da instância core, com prefixo n3x_n3x_core_ e rótulos automáticos plugin=\"n3x.core\" e instance=\"core\"; nomes com agent_ para não colidir com as do controller, que a FDD 45 consolida; hipótese H-13",
+      "n3x_n3x_core_agent_registers_total{result (ok, exhausted, unavailable, unauthenticated, incompatible, refused, error)} (counter): tentativas de Register por classe",
+      "n3x_n3x_core_agent_registered (gauge 0 ou 1): 1 depois de um Register OK e até o próximo resend_register ou recusa; 0 nos outros casos e no ModeUnregistered",
+      "n3x_n3x_core_agent_register_bytes (gauge): tamanho serializado da mensagem (0 sem mensagem)",
+      "n3x_n3x_core_agent_heartbeat_streams_total{reason (first, rotate, reopen)} (counter): aberturas do stream",
+      "n3x_n3x_core_agent_heartbeat_stream_ends_total{reason (server_closed, unavailable, rejected, exhausted, refused, ack_timeout, rotate, shutdown)} (counter): fins do stream",
+      "n3x_n3x_core_agent_heartbeat_rtt_seconds (histogram): do envio do ping ao ack (buckets padrão da FDD 06)",
+      "n3x_n3x_core_agent_resend_requests_total{result (honored, coalesced, limited)} (counter): pedidos de resend_register",
+      "n3x_n3x_core_agent_events_total{kind (6 valores e unknown), result (buffered, failed)} (counter): eventos entregues ao buffer ou perdidos na entrada",
+      "n3x_n3x_core_agent_exits_total{reason (drain, sigterm), result (ok, failed, skipped)} (counter): avisos de saída",
+      "Cardinalidade: no máximo 7 + 1 + 1 + 3 + 8 + 1 + 3 + 14 + 6 séries por sidecar; nenhum rótulo com identidade, nonce, id de evento, hash ou plugin de origem do evento",
+      "L-12 aplicada: o agente não registra nenhuma n3x_controller_*. n3x_controller_connected, n3x_controller_buffer_items e n3x_controller_buffer_dropped_total vêm da conexão (FDD 38); n3x_controller_session_age_seconds e n3x_controller_logins_total vêm do SessionReporter (FDDs 09 e 39); n3x_sidecar_events_* vêm da fila (FDD 09)",
+      "Leitura combinada: n3x_sidecar_events_total - n3x_sidecar_events_dropped_total é o que o agente recebeu; agent_events_total{result=\"buffered\"} é o que entrou no buffer; a diferença para n3x_n3x_core_events_total no controller (FDD 43) é a perda no buffer"
+    ],
+    "logs": {
+      "format": "JSON do SDK, FDD 06; component=plugin, plugin_id=n3x.core, instance=core\n\nProteção de dados: nunca aparecem token, authorization, controller.secret, nonce de sessão, kid, bytes do manifesto ou da config. detail de register_rejected é o texto do status do controller, cortado em 256 bytes; as FDDs 33 e 36 garantem que ele não leva dado sensível. O canário (secrettest.CanaryPrefix) no controller.secret e numa config de plugin não aparece em nenhum log, métrica ou mensagem gravada pelo FakeCore além dos marcadores mascarados (critério da seção 9)\n\nsecret_in_clear: o log warn é do executor (FDD 17); o agente só envia o evento",
+      "fields": [
+        "agent_ready: nível info; campos mode, tasks, register_bytes, config_hash, heartbeat_interval_ms; amostragem uma vez",
+        "agent_inactive: nível info; campos reason; amostragem uma vez",
+        "agent_unregistered: nível error; campos reason (effective_config, register_too_large, invalid_input), tasks; amostragem uma vez",
+        "register_too_large: nível error; campos bytes, limit, manifest_bytes, config_bytes; amostragem uma vez",
+        "register_invalid_input: nível error; campos field; amostragem uma vez",
+        "register_sent: nível info; campos trigger (session, resend, retry, restart), generation, session_kind, config_hash, bytes, controller_proto, attempt, duration_ms, request_id; amostragem toda vez",
+        "register_failed: nível warn; campos class, code, attempt, next_ms, request_id, count; amostragem 1 por minuto",
+        "register_rejected: nível error; campos code, detail, proto_major, proto_minor, accepted_major (em FAILED_PRECONDITION), request_id; amostragem 1 por 10 min por código",
+        "register_response_invalid: nível warn; campos field; amostragem 1 por processo",
+        "heartbeat_stream_opened: nível info; campos epoch, reason (first, rotate, reopen), generation; amostragem first e reopen depois de queda; rotate em debug",
+        "heartbeat_stream_closed: nível warn; campos epoch, reason, code, pings, lived_ms, next_ms; amostragem 1 por minuto (com a contagem); rotate e shutdown em debug",
+        "heartbeat_rejected: nível error; campos code, detail; amostragem 1 por 10 min",
+        "heartbeat_ack_unexpected: nível warn; campos epoch, seq, pending_seq; amostragem 1 por minuto",
+        "heartbeat_resend_requested: nível info; campos epoch, result; amostragem 1 por minuto",
+        "heartbeat_ping e heartbeat_ack: nível debug; campos epoch, seq, rtt_ms, resend_register; amostragem sem amostragem em debug",
+        "event_buffered: nível debug; campos seq, kind, source_plugin, source_instance; amostragem em debug",
+        "event_buffer_failed: nível warn; campos seq, kind, code, count; amostragem 1 por minuto",
+        "exit_sent: nível info; campos reason, code, duration_ms; amostragem uma vez",
+        "exit_failed: nível warn; campos reason, code, duration_ms; amostragem uma vez",
+        "exit_skipped: nível info; campos reason (not_registered); amostragem uma vez"
+      ]
+    },
+    "tracing": {
+      "sampling": "Sem tracing distribuído na v1 (ADR-010 do core). Correlação pelo request_id de cada Register (o mesmo valor vai como x-request-id, L-13), pelo seq do evento (que aparece no id no controller) e pela época do stream nos logs do heartbeat"
+    },
+    "dashboards_alerts": [
+      "Dashboards e alertas: para a FDD 45 consolidar e a FDD 47 documentar",
+      "Painel \"Agente do core\" por instância: agent_registered, rate(agent_registers_total[5m]) por result, rate(agent_heartbeat_stream_ends_total[5m]) por reason, p99 de agent_heartbeat_rtt_seconds, rate(agent_events_total[5m]) por kind, agent_exits_total por result",
+      "Alertas sugeridos: n3x_n3x_core_agent_registered == 0 and n3x_controller_connected == 1 por mais de 5 min (aviso: conectado e sem registro)",
+      "Alertas sugeridos: increase(n3x_n3x_core_agent_registers_total{result=~\"refused|incompatible\"}[15m]) > 0 (crítico: o controller recusa o conteúdo)",
+      "Alertas sugeridos: increase(n3x_n3x_core_agent_heartbeat_stream_ends_total{reason=~\"ack_timeout|refused\"}[15m]) > 3 (aviso)",
+      "Alertas sugeridos: increase(n3x_n3x_core_agent_exits_total{result=\"failed\"}[1h]) > 0 em muitos sidecars (aviso: saídas sem aviso viram desconexão por timeout)"
+    ]
+  },
+  "dependencies_compatibility": {
+    "dependencies": [
+      {
+        "component": "Go",
+        "min_version": "1.26",
+        "notes": "toolchain das imagens (ADR-021 do n3x-sdk)"
+      },
+      {
+        "component": "n3x-sdk (proxy, telemetry, plugin)",
+        "min_version": "primeira pré-release com proxy.CoreEnv, Sidecar.SetConfigHash, EventQueue, ExitTimeout, Buffered e Sleep (FDDs 06, 09, 37 e 38)",
+        "notes": "o core é compilado com a mesma versão do runtime (L-57)"
+      },
+      {
+        "component": "n3x-sdk/artifact",
+        "min_version": "v0.2.0",
+        "notes": "só no teste de constantes (artifact.MaxManifestSize, FDD 22)"
+      },
+      {
+        "component": "n3x-sidecar core/",
+        "min_version": "versão com as FDDs 17, 18, 25, 29 e 38",
+        "notes": "ExitContext ligado à conexão, Draining ligado ao canal de controle, identidade do pré-voo"
+      },
+      {
+        "component": "n3x-plugin-core corev1",
+        "min_version": "proto 1.0 (FDD 36)",
+        "notes": "MaxRegisterBytes, ExitReasonDrain, ExitReasonSigterm"
+      },
+      {
+        "component": "n3x-plugin-core effconfig e agent/effective",
+        "min_version": "FDD 37",
+        "notes": "Result{Document, Hash}"
+      },
+      {
+        "component": "n3x-plugin-core agent/session",
+        "min_version": "FDD 39",
+        "notes": "Manager.Next, Current, interceptors"
+      },
+      {
+        "component": "google.golang.org/grpc e google.golang.org/protobuf",
+        "min_version": "as do go.mod do core",
+        "notes": "WaitForReady, durationpb, timestamppb"
+      },
+      {
+        "component": "Controller (n3x-controller e metade de controller do core)",
+        "min_version": "FDD 33 (keepalive MinTime 20 s, 16 streams por conexão, 1 s por mensagem) e FDD 43",
+        "notes": "antes da 43, os testes usam o FakeCore; o core mínimo v0.1.0 responde UNIMPLEMENTED"
+      }
+    ],
+    "compatibility_guarantees": [
+      "Proto: o agente envia proto_version = corev1.Version() e aceita qualquer minor do controller; campos novos de uma minor mais nova nos acks e respostas são ignorados pelo proto3",
+      "Keepalive: o heartbeat de aplicação não muda o keepalive da conexão (30 s com prazo de 10 s, FDD 38), que respeita o MinTime de 20 s do servidor (FDD 33)",
+      "Formato do id: nonce:seq com 33 caracteres fica estável na major 1 do proto; o controller só depende dele pela internal/eventid do mesmo repositório (as duas metades vêm da mesma versão do core numa imagem coerente, ou de versões diferentes que mantêm o formato)",
+      "Tarefas: os nomes das 6 tarefas viram o rótulo task de pprof, logs e n3x_plugin_background_restarts_total e ficam estáveis na major do core",
+      "Métricas e logs: nomes e valores de rótulo novos entram por minor; nenhum é renomeado na major",
+      "Istio: o mesmo agente roda no alvo istio-1.31; só o reason do Exit muda (sigterm) até a FDD 49 ligar a fonte da drenagem"
+    ]
+  },
+  "acceptance_criteria": [
+    "Sem hook: proxy.HooksOf da instância core vazio; proxy.CheckPrivileged passa; go test de conformance.RunCore (FDD 07) com o core real passa",
+    "Tarefas: em ModeActive, exatamente 6 tarefas com os nomes do contrato 1; em ModeUnregistered, 1 (session); em ModeInactive, 0; com background.max_tasks: 5 para o n3x.core, o New falha com ErrTooManyTasks",
+    "Constantes (pedido da FDD 22): teste effconfig.MaxSize + artifact.MaxManifestSize + registrar.ReserveBytes <= corev1.MaxRegisterBytes; Register montado com config de 512 KiB, manifesto de 480 KiB e identidade no tamanho máximo tem proto.Size menor que 1 MiB",
+    "register_too_large: com manifesto de 600 KiB e config de 512 KiB, nenhum Register chega ao FakeCore, 1 log register_too_large com os quatro tamanhos, agent_unregistered com reason=register_too_large, só a tarefa session",
+    "Sem config efetiva (pedido da FDD 37): com effective.Compute falhando, 0 chamadas ao serviço Core em 10 min (relógio falso) e o login da FDD 39 continua acontecendo",
+    "Primeiro registro: com Link, o primeiro Register chega em até 100 ms depois do primeiro login (relógio falso) com todos os campos do contrato 2 e o config_hash igual a res.Hash; o primeiro ping chega em até 100 ms depois do OK",
+    "Um Register por sessão (pedido da FDD 39): com TTL de 5 min por 1 h, o FakeCore recebe um Register aceito por geração (first, renewed e relogin) e o config_hash é o mesmo em todos",
+    "Troca do stream: no mesmo teste, em toda renovação o stream antigo termina antes de o novo abrir, o novo manda o ping seq 1 em até 10 ms (relógio falso), nenhum ping sai depois do exp da sessão que o carrega e não há intervalo de heartbeat_interval sem ping no FakeCore",
+    "resend_register: com ResendOnNextAck, um Register chega em até ResendSpread (5 s); dez acks seguidos com o pedido geram 1 Register e agent_resend_requests_total{result=\"coalesced\"} ou \"limited\" nos outros 9",
+    "Códigos do Register: teste de tabela com cada código da tabela do contrato 3, conferindo classe, próxima espera (1; 1,6; 2,6 s... até 60 s com Rand fixo), ausência de reenvio na recusa do conteúdo e reenvio na sessão seguinte; FAILED_PRECONDITION com a mensagem da FDD 36 loga accepted_major=1",
+    "RESOURCE_EXHAUSTED (pedido da FDD 41): três respostas RESOURCE_EXHAUSTED seguidas de OK geram 4 tentativas com esperas de backoff, e o heartbeat abre depois da primeira",
+    "Queda e volta (SetDown, FDD 12): com o host em SetDown(true) por 2 min e de volta, o stream reabre em até 1 s depois do fim do SetDown e o Register pedido pelo ack chega em até 6 s; nenhuma requisição do sdktest falha durante a queda",
+    "ack_timeout (pedido da FDD 38): com HoldAcks(true), o stream é cancelado em AckTimeout (5 s com intervalo de 10 s) e reaberto com backoff; nenhuma goroutine fica presa em SendMsg ou RecvMsg",
+    "Panic de ponta a ponta (pedido da FDD 12): depois do registro, PushEvent de um panic e Advance(100 ms) fazem o FakeCore receber exatamente 1 evento com id <nonce>:0000000000000001 (ou o Seq correspondente) e suppressed igual ao da fila",
+    "Conversão (pedidos das FDDs 18 e 36): teste de tabela com os 6 tipos mais um número desconhecido, conferindo cada campo do contrato 5; corev1.MaxEventDetailLen == proxy.MaxEventDetail",
+    "Eventos sem duplicar: com o controller fora do ar por 2 min e 1.200 eventos empurrados, ao voltar o FakeCore recebe os mais novos em ordem crescente de seq, Events() sem repetidos e Duplicates() igual ao número de respostas perdidas injetadas; perdas somadas em n3x_sidecar_events_dropped_total mais n3x_controller_buffer_dropped_total iguais a 1.200 menos os recebidos",
+    "Eventos depois do registro: com o controller fora do ar desde a subida, 0 eventos chegam antes do primeiro Register aceito",
+    "Saída: com StartDrain(20s) e depois o stop, o FakeCore recebe DRAIN_START pelo buffer antes do cancelamento e um Exit com reason=drain em até 1,5 s depois dele; sem drenagem, reason=sigterm; sem registro no processo, nenhum Exit e exit_skipped; com o host respondendo em 3 s, exit_failed com DeadlineExceeded em 1,5 s e o processo para dentro dos 2 s",
+    "Sem vazamento: depois do Stop, 0 goroutines com rótulo de tarefa do core em até 2 s; teste de 10 min (relógio falso) com 200 ciclos de SetDown e 20 renovações termina com o número de goroutines do processo igual ao do início, tolerância de 2",
+    "Segredos: canário no controller.secret e numa config de plugin; secrettest.Leaks sobre logs, métricas, mensagens gravadas pelo FakeCore e status devolvidos dá 0",
+    "Análise estática: o pacote agent/... passa nas 18 regras da FDD 24 sem nenhum //n3x:allow",
+    "go test -race ./agent/... ./internal/eventid/... sem falhas; cobertura de linhas de pelo menos 85% em agent/registrar, agent/heartbeat, agent/events e agent/exit (hipótese)"
+  ],
+  "risks": [
+    {
+      "risk": "Rajada de eventos enche o buffer e descarta o que importa",
+      "mitigation": [
+        "amostragem de panic em 1 por instância por segundo com Suppressed na fila do runtime (FDD 09)",
+        "o disjuntor abre depois de poucos panics e corta a fonte (FDD 18)",
+        "fila do core com pelo menos metade de max_items e sem expulsão por outro plugin (FDD 38)",
+        "Register e Exit fora do buffer"
+      ],
+      "probability": "medium",
+      "impact": "eventos de panic de um plugin com bug expulsam eventos raros (drain_start, plugin_disabled) da fila do core no buffer durante uma queda longa do controller",
+      "contingency_plan": "se a medida da FDD 48 mostrar perda de plugin_disabled, adicionar prioridade por tipo na fila do core do buffer numa minor da FDD 38"
+    },
+    {
+      "risk": "Conflito de identidade falso na renovação ou no restart do pod",
+      "mitigation": [
+        "quebra antes de abrir na troca do stream: um processo nunca tem dois streams (G3)",
+        "Register da sessão nova antes do primeiro ping dela",
+        "Exit em até 1,5 s no desligamento, ligado à sessão do token (E5)",
+        "regra de conflito proposta à FDD 43 com dois streams abertos ao mesmo tempo por 2 intervalos (E4)"
+      ],
+      "probability": "medium",
+      "impact": "o painel mostra conflito sem haver dois processos, e o operador perde a confiança no alerta",
+      "contingency_plan": "acrescentar ao proto, numa minor, um boot_id no Register e no HeartbeatPing (o mesmo nonce dos eventos), para o controller separar processos sem heurística (P-01)"
+    },
+    {
+      "risk": "Goroutines ou streams vazando dentro do Envoy",
+      "mitigation": [
+        "ctx próprio por stream com defer cancel(), inclusive no panic",
+        "um stream e seis tarefas fixas, sem instrução go",
+        "teste de longa duração com quedas e renovações e contagem de goroutines (seção 9)"
+      ],
+      "probability": "low",
+      "impact": "memória crescendo no worker do Envoy ao longo de dias, até o limite do container",
+      "contingency_plan": "perfil de goroutines com o rótulo das tarefas do core na FDD 50; reinício controlado do processo pelo orquestrador enquanto a correção não sai"
+    },
+    {
+      "risk": "Tempestade de Register depois de restart do controller",
+      "mitigation": [
+        "espalhamento uniforme de até 5 s nos reenvios pedidos por resend_register",
+        "a reconexão da FDD 38 já tem jitter de 20%",
+        "Register típico de 20 a 30 KiB (manifesto e config reais), não 1 MiB"
+      ],
+      "probability": "medium",
+      "impact": "500 sidecars reenviando até 1 MiB cada no mesmo segundo pesam na CPU e na memória do controller recém-subido",
+      "contingency_plan": "a FDD 51 mede com 500 sidecars; se passar do orçamento, aumentar MaxResendSpread ou fazer o controller responder resend_register em lotes"
+    },
+    {
+      "risk": "Store degradado recebendo Register em laço",
+      "mitigation": [
+        "backoff até 60 s depois de RESOURCE_EXHAUSTED",
+        "registro parcial mantém o heartbeat e a instância visível"
+      ],
+      "probability": "low",
+      "impact": "tráfego e CPU desperdiçados enquanto o Store não sai do degradado",
+      "contingency_plan": "a FDD 43 pode devolver um intervalo sugerido no texto do status ou num campo novo numa minor"
+    },
+    {
+      "risk": "Recusa do conteúdo esconde o sidecar do painel",
+      "mitigation": [
+        "log register_rejected em error com o código e o alerta crítico da seção 7",
+        "nova tentativa a cada sessão nova (cerca de 48 min) e em resend_register de stream novo",
+        "teste cruzado effconfig entre as duas metades na CI (FDDs 37 e 48)"
+      ],
+      "probability": "low",
+      "impact": "um bug de canonicalização ou de limite faz o controller recusar com DATA_LOSS ou INVALID_ARGUMENT, e o sidecar some do inventário até a próxima sessão",
+      "contingency_plan": "restart do sidecar depois da correção do controller; não há reenvio em laço que agrave o problema"
+    },
+    {
+      "risk": "Limite de tarefas configurado abaixo de 6 derruba a subida",
+      "mitigation": [
+        "mensagem do ErrTooManyTasks cita o campo (FDD 06)",
+        "pedido à FDD 15 para recusar no validate valor abaixo de agent.NumTasks",
+        "guia do operador (FDD 47)"
+      ],
+      "probability": "low",
+      "impact": "o Envoy não sobe por um ajuste de runtime.plugin_limits[\"n3x.core\"]",
+      "contingency_plan": "juntar heartbeat_recv e exit numa tarefa só numa minor, se surgir caso real de limite apertado"
+    },
+    {
+      "risk": "Controller vivo que não responde ack",
+      "mitigation": [
+        "AckTimeout de até 5 s cancela o stream e reabre",
+        "o servidor corta o stream que passa de 1 s numa mensagem (FDD 33)"
+      ],
+      "probability": "low",
+      "impact": "o heartbeat parece aberto, mas o controller marca a instância como desconectada",
+      "contingency_plan": "o alerta de ack_timeout da seção 7 aponta o controller para investigação"
+    }
+  ]
+}
