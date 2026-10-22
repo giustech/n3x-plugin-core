@@ -67,6 +67,12 @@ Além disso, o marco M2 precisa de um `.so` do builder com o plugin core, antes 
   - FDD 08: `Validate` dos usuários no tipo de config do core; aviso de `hmac_key` fora da `Validate`, no `New` (contrato 7, regras nas FDDs 39 e 40)
   - FDD 09: serviço próprio do login (L-11, contrato 1); `HostValidator` no tipo de config com a regra `root_name` que a FDD 40 aplica (contrato 7); tipo de config da metade de proxy vazio (contrato 6)
   - FDD 17: config da metade de proxy vazia e versão mínima do core para o M2, com a instância `core` e as capacidades conferidas por `CheckPrivileged` (contrato 8)
+- Decisões aprovadas pelo responsável do produto em 2026-10-22 (resolvem as hipóteses correspondentes deste documento):
+  - **D-01 (L-11):** o login é o serviço próprio `n3x.plugins.n3x.core.v1.Login`, com o método `Login`; `Core/Login` deixa de existir. O ADR-007 e o HLD do core, que ainda põem `Login` em `Core`, precisam ser corrigidos (reflexo pendente)
+  - **D-02 (I-09 e I-02):** ficam aprovados `RegisterResponse.proto_version` (campo 1), `EventRequest.plugin_instance` (6) e `EventRequest.suppressed` (7), e o prefixo `EVENT_KIND_` nos valores do enum. O HLD e o ADR-007 precisam refletir isso (reflexo pendente)
+  - **D-03:** faixas e defaults do contrato 6 aprovados como escritos: `inventory_retention` de 1 min a 7 dias (padrão 24 h), `memory_limit` de 16 MiB a 1 GiB (padrão 128 MiB), `session.ttl` de 5 min a 24 h (padrão 1 h), até 100 usuários de leitura e seção ausente valendo `{}`
+  - **D-05 (decidida na análise da FDD 39/CORE-03):** `session.hmac_key` só é aceita em `ENC[...]`; chave em claro é recusada na `Validate` e o controller não sobe. O aviso `hmac_key_in_clear` deixa de existir. A L-64 (hash em claro aceito sem aviso) continua valendo só para `users[].password_hash`
+  - **D-04 (L-32):** a v1 aceita só a major 1; não há janela da major anterior. `Register` sem `proto_version` é recusado com `FAILED_PRECONDITION`, e pacote do core em major não registrada é recusado pelo host antes da autenticação. A pendência "janela de aceitação da major anterior" do HLD fica fora da v1
 
 ---
 
@@ -101,7 +107,7 @@ Além disso, o marco M2 precisa de um `.so` do builder com o plugin core, antes 
 - Comportamento de cada RPC: login e token na FDD 39 (CORE-03); registro, heartbeat, eventos e saída no sidecar na FDD 42 (CORE-06); tratamento no controller na FDD 43 (CORE-07)
 - Formato da config efetiva enviada em `RegisterRequest.config`, mascaramento e hash: FDD 37 (CORE-02)
 - Regras de validação dos usuários (duplicado, `root_name`, bcrypt, custo, gramática do nome): FDD 40 (CORE-04); aqui só os pontos de composição e os códigos reservados
-- Formato da `session.hmac_key`, avisos de chave ausente ou em claro e formato do token: FDD 39 (CORE-03)
+- Formato da `session.hmac_key`, aviso de chave ausente, recusa de chave em claro e formato do token: FDD 39 (CORE-03)
 - Teto de memória, contabilidade e retenções de 20 versões e 200 eventos (constantes, sem campo de config na v1): FDD 41 (CORE-05), com as FDDs 43 e 44
 - Sentido exato de `inventory_retention` (L-66): FDD 43 (CORE-07)
 - Inclusão obrigatória do core no build (`N3X-B008`): FDD 20 (BLD-02)
@@ -874,7 +880,7 @@ cb, _ := c.MarshalJSON()
 - Semântica de status/headers:
   - **Por que um tipo definido:** `ValidateHost` recebe `ctrl.HostFacts`, então quem o declara importa `controller/` do SDK. Declarado em `types/`, esse import chegaria ao `.so` por `agent` (I-03). `type Config types.ControllerConfig` tem os mesmos campos e tags, logo o mesmo schema, e recebe os métodos no pacote `controller` do core, que só entra no binário do controller. O tipo mora no módulo do core, o que atende à regra de origem do `CheckPrivileged` (FDD 09, regra 2)
   - **Composição das regras:** nesta FDD, `Validate` e `ValidateHost` devolvem `nil`; as FDDs 39 e 40 acrescentam as regras abaixo, sem mudar as assinaturas. Erros no formato da FDD 08: `plugin.FieldErrors` com caminho relativo à seção (`users[1].name`), prefixado pelo host com `plugin.PrefixErrors(err, plugin.PathKey("plugins", "n3x.core"))`, e `Detail` sem valor
-  - **Aviso de `hmac_key` (pedido da FDD 08):** a `Validate` é pura e não loga. O aviso de chave ausente (`hmac_key_missing`) e em claro (`hmac_key_in_clear`) sai no `New` da metade de controller, com `env.Log()`, uma vez por processo (FDD 39)
+  - **Aviso de `hmac_key` (pedido da FDD 08):** a `Validate` é pura e não loga. O aviso de chave ausente (`hmac_key_missing`) sai no `New` da metade de controller, com `env.Log()`, uma vez por processo (FDD 39); chave em claro não gera aviso, é recusada pela `Validate` (D-05)
   - **Segredos na validação:** a FDD 40 lê o `password_hash` só por `Reveal()` para conferir prefixo e custo; nada do valor entra em `Detail`
   - **L-64:** `password_hash` sem `ENC[...]` é o caso normal e não gera aviso; com `ENC[...]`, cifrado por `n3x-controller encrypt --plugin n3x.core` com a AAD `n3x:v1:controller:n3x.core` (FDD 03, L-05)
   - **Seção ausente:** vale `{}` (hipótese; FDD 30 aplica): sem usuários de leitura (só o root entra) e com chave HMAC aleatória
@@ -889,6 +895,7 @@ Códigos de regra reservados para a seção (nomes além de `root_name` são hip
 | `users[i].password_hash` | `bcrypt_format` | não é bcrypt (prefixos da L-39) | FDD 40, com a FDD 30 |
 | `users[i].password_hash` | `bcrypt_cost` | custo menor que 12 | FDD 40 |
 | `session.hmac_key` | `hmac_key_format` | não é o base64 de 32 bytes do `keygen` | FDD 39 |
+| `session.hmac_key` | `hmac_key_not_sealed` | chave presente sem `ENC[...]` (nome da regra proposto; D-05) | FDD 39 |
 
 **Exemplo de requisição** (seção com erros, `CheckHost` com root `admin`)
 ```yaml
@@ -1066,7 +1073,7 @@ plugins[0].id: o plugin core é implícito e não se declara em plugins [core_im
 | `password_hash` sem `ENC[...]` | Aceito, sem aviso (L-64) | `InClear()` verdadeiro |
 | `password_hash` ou `hmac_key` em `ENC[...]` de outro escopo | `secret_decrypt`; o controller não sobe | FDD 03 |
 | `hmac_key` ausente ou vazia | Aceita; chave aleatória; aviso `hmac_key_missing` no `New` | FDD 39 |
-| `hmac_key` em claro | Aceita; aviso `hmac_key_in_clear` no `New` | FDD 39 |
+| `hmac_key` em claro | Recusada pela regra `hmac_key_not_sealed` na `Validate`; o controller não sobe | FDD 39; D-05 |
 | `n3x.core` declarado em `plugins[]` do sidecar | `core_implicit`; o Envoy não sobe | FDD 15 |
 | Config da metade de proxy diferente de `{}` | `unknown_field` | Só o executor cria a instância |
 | `New` sem `CoreEnv` (sidecar ou controller) | Erro; a subida falha | Runtime errado ou teste mal montado |
@@ -1109,7 +1116,7 @@ plugins[0].id: o plugin core é implícito e não se declara em plugins [core_im
 | `core_proto_rejected` | warn | `plugin_id`, `method`, `service`, `instance` (quando conhecidos), `proto_major`, `proto_minor`, `accepted_major` | FDD 43 (`Register`) e FDD 33 (major não registrada, sem identidade) | no máximo 1 por minuto por par (serviço, major) (hipótese) |
 | `core_skeleton` | warn | `plugin_id`, `instance`, `half` | versão mínima (contrato 8) | uma vez por processo e metade |
 | `hmac_key_missing` | warn | `plugin_id` | FDD 39, no `New` | uma vez por processo |
-| `hmac_key_in_clear` | warn | `plugin_id`, `path` (`session.hmac_key`) | FDD 39, no `New` | uma vez por processo |
+| `hmac_key_in_clear` | (removido) | | | Substituído pela recusa `hmac_key_not_sealed` (D-05) |
 
 - Exemplo: `{"ts":"2026-10-20T14:05:00.010Z","level":"warn","component":"host","msg":"core_proto_rejected","plugin_id":"n3x.core","method":"/n3x.plugins.n3x.core.v1.Core/Register","service":"pedidos","instance":"pedidos-7d9f8b-xk2lp","proto_major":2,"proto_minor":0,"accepted_major":1}`
 - No sidecar, a FDD 42 loga a recusa recebida com os mesmos nomes de campo (`proto_major`, `proto_minor`) e o `accepted_major` lido da mensagem

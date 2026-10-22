@@ -9,7 +9,8 @@ O controller não tem armazenamento próprio, e o PRD deixou para este HLD a def
 ## Decisão
 - Na v1, o core guarda tudo em memória, sem banco e sem disco.
 - O armazenamento fica atrás da porta `Store` (inventário, configs, eventos e usuários), com uma única implementação na v1, a `memory`.
-- O adaptador usa estruturas de Go do próprio core, não o `env.Memory()` do SDK. O motivo é que essa memória do SDK descarta itens em silêncio ao atingir a cota (ADR-017 do SDK).
+- O adaptador usa o `memory.Map` do SDK e fica sujeito à cota do SDK (decisão revista em 2026-10-22; o texto original previa estruturas de Go do próprio core, fora da cota). Para manter o descarte explícito e o estado degradado do ADR-009, o core consulta o uso e a cota, remove itens de forma explícita e detecta o teto atingido, o que o `n3x-sdk` já expõe (confirmação do responsável; a conferência contra o código do SDK fica para a fase `plan`).
+- O `memory_limit` (padrão 128 MiB) e a cota de memória do core no SDK (`runtime.plugin_limits["n3x.core"].memory.max_bytes`) precisam ser alinhados na implementação, já que a cota padrão do controller é menor (64 MiB).
 - O campo `storage.dsn` sai da seção `plugins.n3x.core` do `n3x.yaml` do controller.
 - Depois de um restart, o estado se reconstrói pelos sidecars, com novo login ou com o `resend_register` do heartbeat.
 

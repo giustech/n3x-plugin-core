@@ -94,11 +94,11 @@ Padrões adotados
 | `agent/exit` | No SIGTERM ou no início da drenagem, chama `Exit` em modo de melhor esforço, dentro dos 2 s | Canal de controle do entrypoint |
 | `controller/auth` | Handler `Login` (rota pública, via `PublicGRPC`): confere a credencial com `env.Credentials().Verify` e emite o token. Fornece também o `Authenticate`, que valida o token para o interceptor do host. É dono da chave HMAC (ADR-004). | `env.Credentials()` e `session.hmac_key` |
 | `controller/registry` | Serviço `Core`: valida os campos, a `proto_version`, o hash e se a identidade bate com a do token. Repassa para o `inventory` e o `configs`. | `auth`, `inventory` e `configs` |
-| `controller/inventory` | Instâncias e sessões, estados (conectado, desconectado e histórico), conflito de identidade, divergência de manifesto e eventos | `Store` |
+| `controller/inventory` | Instâncias e sessões, estados (conectado e desconectado), conflito de identidade, divergência de manifesto e eventos | `Store` |
 | `controller/configs` | Versões de config por hash, a config atual de cada instância, a divergência de config no serviço e o diff entre versões e entre instâncias | `Store` |
 | `controller/directory` | Diretório de usuários de leitura vindos do `n3x.yaml`: `CheckUser` com bcrypt, e `ChangePassword` que devolve "não suportado" (ADR-003) | Config tipada |
 | `controller/store/memory` | Implementação em memória da porta `Store`, com contabilidade de bytes, teto, ordem de descarte e snapshots imutáveis (ADR-009) | Nenhuma |
-| `controller/janitor` | Marca como desconectado depois de 3 intervalos sem heartbeat, move para o histórico depois de `inventory_retention`, aplica as retenções e o descarte | `inventory`, `configs` e `env.Background()` |
+| `controller/janitor` | Marca como desconectado depois de 3 intervalos sem heartbeat, remove do inventário depois de `inventory_retention`, aplica as retenções e o descarte | `inventory`, `configs` e `env.Background()` |
 | `controller/panel` | Telas com widgets (sidecars, configs, fluxo e usuários) e cartões da visão geral | `inventory`, `configs` e `directory` |
 | `controller/metrics` | Métricas de negócio `n3x_n3x_core_*` | `env.Metrics()` |
 | `proto/` e `types/` | `.proto` do serviço `Core` com os stubs gerados, e as structs de config das duas metades com tags `n3x` e `desc` | buf e SDK |
@@ -141,7 +141,7 @@ Padrões adotados
   - o login é refeito com backoff de 1 a 60 s e jitter de 20%
 - **Restart do controller com `session.hmac_key`:** os tokens continuam válidos. O primeiro heartbeat recebe `resend_register`, e o inventário se reconstrói em cerca de 1 intervalo.
 - **Restart do controller sem `session.hmac_key`:** a chave nova invalida os tokens. O próximo envio recebe `UNAUTHENTICATED`, o sidecar refaz o login com jitter e reenvia o registro. Como o cache de credencial do host é por serviço, o custo é de cerca de um bcrypt por serviço (cerca de 12 s de CPU com 50 serviços).
-- **Três intervalos sem heartbeat:** a instância fica desconectada. Depois de `inventory_retention` (24 h), vai para o histórico.
+- **Três intervalos sem heartbeat:** a instância fica desconectada. Depois de `inventory_retention` (24 h desde a desconexão), é removida do inventário; não há fase de histórico separada.
 - **Conflito de identidade:**
   - acontece quando chega um segundo `Register` com a mesma identidade e outro nonce, e as duas sessões mandam heartbeat no mesmo intervalo
   - o controller marca o conflito no painel, no log e na métrica, e mantém as duas sessões
@@ -164,7 +164,7 @@ Entidades principais
 - `Instance`:
   - serviço, instância e endereço
   - alvo (`envoy-1.40` ou `istio-1.31`) e versão do Envoy
-  - estado (conectado, desconectado ou histórico) e "visto por último"
+  - estado (conectado ou desconectado) e "visto por último"
   - ponteiros para o manifesto e para a config atual
   - histórico de hashes
 - `Session`: nonce, emitido em, expira em, intervalo do heartbeat e último ping
@@ -184,11 +184,12 @@ Exemplo de config efetiva já mascarada:
   "format": 1,
   "sidecar": {
     "service": "api-pedidos",
-    "listen": 15001,
+    "listener": { "port": 17000 },
     "controller": { "address": "controller:17443", "secret": "***:9f2c41ab07de", "heartbeat_interval": "10s" }
   },
   "plugins": [
     { "id": "acme.ratelimit", "instance": "rl-api", "phase": "traffic", "order": 10, "failure": "open",
+      "async": { "max_inflight": 1000, "timeout": "200ms" }, "match": { "grpc_services": [], "methods": [], "paths": [] },
       "config": { "limit": 100, "redis_password": "***:51e0c3aa9b12" } }
   ]
 }
@@ -196,6 +197,9 @@ Exemplo de config efetiva já mascarada:
 - O JSON é canônico pela RFC 8785: chaves ordenadas, números normalizados e sem espaços. O exemplo acima foi formatado só para leitura.
 - **Mascaramento:** todo campo marcado como segredo no schema do plugin (tipo `plugin.Secret`), e também o `controller.secret` do sidecar, vira `***:` seguido da impressão digital. A impressão digital são os 12 primeiros caracteres hex do SHA-256 do texto `ENC[...]`, ou seja, do cifrado e nunca do valor em claro.
 - **Segredo sem `ENC[...]`:** vira `***:plain`, e o sidecar emite o evento `secret_in_clear`.
+- **Config de uma instância que o core não consegue mascarar com segurança** (sem schema, marcas incoerentes): `***:opaque`. **Documento acima de 512 KiB:** as maiores configs viram `***:omitted:<12 hex>` até caber. Segredo vazio fica `""`.
+- **Inteiros fora de ±(2^53 − 1):** saem como texto com os dígitos exatos, um desvio explícito da RFC 8785 que o controller não precisa conhecer para conferir a forma canônica.
+- **Ordem de `plugins[]`:** fase, depois `order`, depois `instance`; cada item leva também `async` e `match`.
 - **Hash:** `sha256:<hex>` do JSON canônico já mascarado. Por isso, trocar um segredo muda o hash sem expor o valor.
 
 Relações
@@ -211,18 +215,19 @@ Fonte de verdade
 - Usuários de leitura: a seção `plugins.n3x.core.users` do `n3x.yaml` do controller.
 - Root: o `n3x.yaml` do host do controller, fora do core.
 - **Retenção em memória (ADR-009):**
-  - histórico de 24 h (`inventory_retention`)
+  - sidecar desconectado fica no máximo 24 h em memória (`inventory_retention`), sem fase de histórico
   - até 20 versões de config por serviço, descartando primeiro as que não têm instância apontando
   - até 200 eventos por instância
   - teto total de `memory_limit` (128 MiB)
-- **Versionamento:** as configs são versionadas pelo hash. O formato da config tem o campo `format`, que só cresce por adição.
+- **Versionamento:** as configs são versionadas pelo hash. O formato da config tem o campo `format`, que só cresce por adição. A diferença que vem só do `format` (upgrade do core) não conta como divergência de config.
+- **Teto de versões:** até 20 por serviço; uma versão em uso por instância viva nunca é descartada, então o serviço pode passar de 20.
 
 ---
 
 ### Interfaces públicas
 | Nome | Tipo | Protocolo | Exposição | SLAs/Limites |
 | ---- | ---- | ---------- | --------- | ------------- |
-| `n3x.plugins.n3x.core.v1.Core/Login` | API | gRPC (protobuf), TLS 1.3, rota pública sem sessão | Interna (sidecar → controller) | p95 < 300 ms; limites de login do host por IP e serviço |
+| `n3x.plugins.n3x.core.v1.Login/Login` | API | gRPC (protobuf), TLS 1.3, rota pública sem sessão | Interna (sidecar → controller) | p95 < 300 ms; limites de login do host por IP e serviço |
 | `n3x.plugins.n3x.core.v1.Core/Register` | API | gRPC unário | Interna | Mensagem até 1 MiB; p95 < 20 ms |
 | `n3x.plugins.n3x.core.v1.Core/Heartbeat` | Stream | gRPC bidirecional | Interna | Ack < 50 ms; 1 s por mensagem processada; sem teto de 10 s de chamada |
 | `n3x.plugins.n3x.core.v1.Core/Event` | API | gRPC unário, idempotente por `id` | Interna | p95 < 20 ms |
@@ -236,8 +241,11 @@ Fonte de verdade
 syntax = "proto3";
 package n3x.plugins.n3x.core.v1;
 
+service Login {
+  rpc Login(LoginRequest) returns (LoginResponse);   // rota pública, serviço próprio (FDD CORE-01, D-01)
+}
+
 service Core {
-  rpc Login(LoginRequest) returns (LoginResponse);
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(stream HeartbeatPing) returns (stream HeartbeatAck);
   rpc Event(EventRequest) returns (EventResponse);
@@ -253,16 +261,18 @@ message RegisterRequest {
   string envoy_version = 4; bytes manifest = 5; bytes config = 6;
   string config_hash = 7; google.protobuf.Duration heartbeat_interval = 8;
 }
-message RegisterResponse { }
+message RegisterResponse { ProtoVersion proto_version = 1; }   // versão do controller
 message HeartbeatPing  { uint64 seq = 1; google.protobuf.Timestamp sent_at = 2; }
 message HeartbeatAck   { uint64 seq = 1; bool resend_register = 2; }
 enum EventKind {
-  EVENT_KIND_UNSPECIFIED = 0; PANIC = 1; BREAKER_OPEN = 2; PLUGIN_DISABLED = 3;
-  CONFIG_ERROR = 4; DRAIN_START = 5; SECRET_IN_CLEAR = 6;
+  EVENT_KIND_UNSPECIFIED = 0; EVENT_KIND_PANIC = 1; EVENT_KIND_BREAKER_OPEN = 2;
+  EVENT_KIND_PLUGIN_DISABLED = 3; EVENT_KIND_CONFIG_ERROR = 4; EVENT_KIND_DRAIN_START = 5;
+  EVENT_KIND_SECRET_IN_CLEAR = 6;
 }
 message EventRequest {
   string id = 1; EventKind kind = 2; string plugin = 3; string detail = 4;
   google.protobuf.Timestamp occurred_at = 5;
+  string plugin_instance = 6; uint32 suppressed = 7;
 }
 message EventResponse { }
 message ExitRequest   { string reason = 1; }   // sigterm | drain
@@ -288,7 +298,7 @@ message ExitResponse  { }
 ```yaml
 plugins:
   n3x.core:
-    inventory_retention: 24h      # desconectado → histórico
+    inventory_retention: 24h      # tempo total em memória após a desconexão
     memory_limit: 128MiB          # teto do armazenamento em memória
     session:
       ttl: 1h
@@ -312,7 +322,7 @@ Abordagem geral
 Técnicas aplicadas
 - **Deduplicação:** as configs são guardadas pelo hash e os manifestos pelo hash do manifesto. Instâncias iguais não custam memória extra.
 - **Teto de memória (ADR-009):**
-  - Com uso acima de 90% do `memory_limit`, o core descarta nesta ordem: o histórico, depois os eventos mais antigos, depois as versões de config sem instância apontando.
+  - Com uso acima de 90% do `memory_limit`, o core descarta nesta ordem: os sidecars desconectados mais antigos, depois os eventos mais antigos, depois as versões de config sem instância apontando.
   - Se mesmo assim o teto estourar, o core se marca `degradado` e o painel mostra o banner.
   - Degradado, ele continua aceitando heartbeats e mudanças de estado, mas recusa novas versões de config com `RESOURCE_EXHAUSTED`. O sidecar tenta de novo depois.
 - **Snapshots imutáveis por serviço:** a escrita troca o ponteiro do snapshot, e o painel lê sem lock.
@@ -337,7 +347,8 @@ Autenticação
 - **Chave HMAC (ADR-004):**
   - pertence ao core
   - por padrão, 32 bytes de `crypto/rand` gerados no `Start`; opcionalmente, `session.hmac_key: ENC[...]`
-  - sem a chave configurada, a `Validate` emite um aviso no log
+  - sem a chave configurada, o `New` emite um aviso no log (`hmac_key_missing`)
+  - a chave só é aceita em `ENC[...]`; em claro, a `Validate` recusa e o controller não sobe
 - **Painel:**
   - o root é conferido pelo host
   - os usuários de leitura são conferidos pelo `CheckUser` do core contra os hashes do yaml
@@ -355,7 +366,7 @@ Proteção de dados
 - Segredos de plugin nunca saem do sidecar: só sai a impressão digital do cifrado, ou `***:plain` com alerta.
 - **Logs e erros:** nenhum token, segredo, hash de senha ou trecho de config sem máscara entra em log, erro gRPC ou evento. Isso é garantido por testes de varredura de segredos e pela análise estática do SDK.
 - **LGPD:**
-  - IP e nome de usuário só existem em memória, com até 24 h no histórico
+  - IP e nome de usuário só existem em memória, com até 24 h depois da desconexão
   - o acesso é só para quem está autenticado
   - não há trilha formal de auditoria na v1 (ADR-002); login, logout e bloqueio do painel ficam no log operacional do host
 
@@ -402,6 +413,7 @@ Métricas
   - `n3x_n3x_core_heartbeat_lag_seconds` (histograma)
 - **Sidecar:** as métricas já definidas no HLD do sidecar, alimentadas pelo core: `n3x_controller_connected`, `n3x_controller_session_age_seconds`, `n3x_controller_logins_total{result}`, `n3x_controller_buffer_items` e `n3x_controller_buffer_dropped_total`.
 - Latência e erros por RPC vêm do interceptor de métricas do host.
+- O catálogo completo das famílias `n3x_n3x_core_*` (35 da metade de controller e 12 da de proxy) é o `internal/metricdefs` da FDD CORE-09; a lista acima é o núcleo. Entre as novas estão `token_rejections_total`, `hmac_key_configured`, `session_index_entries`, `session_invalidations_total`, `events_rejected_total`, `heartbeat_streams`, `config_versions` e `panel_build_seconds`.
 
 Tracing
 - Não há tracing distribuído na v1, porque são chamadas de controle fora do caminho da requisição.

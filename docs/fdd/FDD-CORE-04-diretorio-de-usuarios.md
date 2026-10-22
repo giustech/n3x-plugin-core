@@ -52,6 +52,11 @@ Responsável: Guilherme Giusti
   - **L-63** (nome do root na `Validate`, fechada na FDD 09): regra `root_name` em `ValidateHost`, comparando sem diferenciar maiúsculas (contrato 1)
   - **L-64** (`plugin.Secret` sem `ENC[...]`, fechada na FDD 03): `password_hash` bcrypt em claro é o caso normal, sem aviso; `ENC[...]` é opcional
   - **L-34** (notação de caminho, fechada na FDD 01): `plugins["n3x.core"].users[0].password_hash` em erros e documentação
+- Decisões aprovadas pelo responsável do produto em 2026-10-22 (resolvem as hipóteses correspondentes):
+  - **D-01:** o custo do bcrypt de `password_hash` fica na faixa de 12 a 16 (o PRD só fixa o mínimo de 12; o máximo de 16 é o mesmo do host). Custo fora da faixa gera `bcrypt_cost` e impede a subida
+  - **D-02:** o login de leitura roda no máximo 2 comparações bcrypt simultâneas (`MaxConcurrentChecks`), com fila de 16 (`MaxWaitingChecks`) e espera máxima de 2 s (`MaxQueueWait`); acima disso, `ctrl.ErrVerifierBusy` sem bcrypt. O root não é afetado
+  - **D-03:** nome com a gramática `^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$`; `duplicate` e `root_name` comparados sem diferenciar maiúsculas; login sensível à caixa; `users: []` é válido e sem aviso (só o root entra); custos misturados geram o aviso `directory_mixed_cost`. O FR-009 do PRD precisa citar a gramática e o teto de 100 usuários (reflexo pendente)
+  - **D-04 (consequência da D-01 da FDD 03/CORE-03):** esta FDD não trata a `session.hmac_key`; a recusa de chave em claro (`hmac_key_not_sealed`) é da FDD 39. A L-64 (hash em claro sem aviso) continua valendo para `password_hash`
 - Pedidos de FDDs anteriores atendidos:
   - FDD 03: `password_hash` em claro aceito sem aviso, `ENC[...]` opcional (contrato 1)
   - FDD 08: `Validate` dos usuários no core (contrato 2)

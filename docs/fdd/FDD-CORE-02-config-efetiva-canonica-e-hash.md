@@ -69,6 +69,11 @@ Esta entrevista achou quatro problemas novos:
   - FDD 09: `SecretMark` decide o marcador de cada segredo (contrato 3)
   - FDD 15: lista exata dos campos do objeto `sidecar` (contrato 1, L-06)
   - FDD 16: o core entrega o `config_hash` também no standalone (contrato 7)
+- Decisões aprovadas pelo responsável do produto em 2026-10-22 (resolvem as hipóteses correspondentes deste documento):
+  - **D-01 (L-06):** o objeto `sidecar` usa a lista fechada de campos do contrato 1, com os nomes do `n3x.yaml` v1 (`listener.port`, nunca `listen`). O exemplo do HLD e do ADR-006, que usa `listen: 15001`, precisa ser corrigido (reflexo pendente)
+  - **D-02 (I-02):** cada item de `plugins[]` inclui `async` e `match`, além dos campos do ADR-006, e a lista é ordenada por fase, depois `order`, depois `instance`, e não pela ordem do arquivo. O ADR-006 e o FR-007 do PRD precisam refletir isso (reflexo pendente)
+  - **D-03 (L-26):** a RFC 8785 é implementada no próprio core (`effconfig/jcs`), com o desvio explícito `BigIntegersAsText`: inteiro com valor absoluto acima de 2^53 − 1 sai como texto com os dígitos exatos. O controller confere a forma canônica com a RFC pura
+  - **D-04:** ficam aprovados os marcadores de config inteira `***:opaque` e `***:omitted:<12 hex>`, o segredo vazio mantido como `""` e o limite de 512 KiB na geração. O critério de aceite do PRD ("segredos só como `***:<impressão digital>` ou `***:plain`") precisa citar essa extensão (reflexo pendente)
 
 ---
 

@@ -9,11 +9,11 @@ Com tudo em memória (ADR-001), o core precisa de um limite explícito para não
 ## Decisão
 - **Teto:** `memory_limit` na seção do core, com padrão de 128 MiB, medido por contabilidade aproximada do tamanho de configs, manifestos, eventos e instâncias.
 - **Retenções:**
-  - histórico de 24 h (`inventory_retention`)
-  - até 20 versões de config por serviço
+  - sidecar desconectado fica no máximo 24 h em memória (`inventory_retention`), sem fase de histórico
+  - até 20 versões de config por serviço (teto mole: uma versão em uso por instância viva nunca é descartada)
   - até 200 eventos por instância
 - **Descarte:** acima de 90% do teto, o core descarta nesta ordem:
-  1. o histórico
+  1. os sidecars desconectados mais antigos
   2. os eventos mais antigos
   3. as versões de config sem instância apontando
 - **Degradado:** se mesmo assim o teto estourar:
@@ -24,7 +24,7 @@ Com tudo em memória (ADR-001), o core precisa de um limite explícito para não
 - **Snapshots imutáveis por serviço** atendem a leitura do painel sem lock.
 
 ## Justificativa
-- O descarte é explícito e em ordem de menor valor, ao contrário do descarte silencioso da memória do SDK.
+- O descarte é explícito e em ordem de menor valor (o core remove os itens e consulta o uso e a cota do `memory.Map`, em vez de deixar o SDK descartar em silêncio).
 - Preserva o estado vivo (quem está conectado), que é o mais importante para o operador.
 
 ## Trade-off

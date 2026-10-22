@@ -7,8 +7,7 @@ Data: 2026-10-20
 O proto de registro, heartbeat, eventos e saída é contrato deste repositório. O FR-016 exige que o controller aceite a mesma major e recuse as outras com `FAILED_PRECONDITION`. O controller precisa conseguir pedir o reenvio do registro depois de perder o estado. Os eventos podem ser reenviados pelo buffer na reconexão.
 
 ## Decisão
-- **Serviço `n3x.plugins.n3x.core.v1.Core`:**
-  - `Login` (rota pública)
+- **Dois serviços no pacote `n3x.plugins.n3x.core.v1`:** `Login`, serviço próprio com o único método `Login` (rota pública), e `Core`, com:
   - `Register`
   - `Heartbeat`, como stream bidirecional
   - `Event`
@@ -19,8 +18,9 @@ O proto de registro, heartbeat, eventos e saída é contrato deste repositório.
   - alvo e versão do Envoy
   - manifesto e config (bytes JSON)
   - `config_hash` e `heartbeat_interval`
+- **`RegisterResponse`:** leva `proto_version`, a versão do controller.
 - **`HeartbeatAck`:** tem `resend_register` para quando o controller não conhece a instância.
-- **`Event`:** tem `id` gerado no sidecar, e o controller ignora os repetidos. Os tipos são `PANIC`, `BREAKER_OPEN`, `PLUGIN_DISABLED`, `CONFIG_ERROR`, `DRAIN_START` e `SECRET_IN_CLEAR`.
+- **`Event`:** tem `id` gerado no sidecar, e o controller ignora os repetidos. Os tipos são `EVENT_KIND_PANIC`, `EVENT_KIND_BREAKER_OPEN`, `EVENT_KIND_PLUGIN_DISABLED`, `EVENT_KIND_CONFIG_ERROR`, `EVENT_KIND_DRAIN_START` e `EVENT_KIND_SECRET_IN_CLEAR` (mais `EVENT_KIND_UNSPECIFIED = 0`, recusado). Também leva `plugin_instance` (6) e `suppressed` (7).
 - **`Exit`:** é de melhor esforço, dentro dos 2 s do desligamento, e marca a instância como desconectada na hora.
 - **Erros do core:**
 

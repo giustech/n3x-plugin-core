@@ -192,7 +192,7 @@ O controller expõe um único servidor gRPC, com uma porta, um TLS e uma autenti
 - Cada plugin com metade de controller registra o próprio serviço gRPC sob `n3x.plugins.<namespace>.<nome>.v1`, derivado do ID do plugin (FR-011)
 - Toda chamada passa por um interceptor de autenticação comum, que valida a assinatura e a validade do token de sessão emitido no login (FR-002), com o autenticador fornecido pelo plugin core, e identifica o serviço e a instância chamadores
 - O login (`n3x.plugins.n3x.core.v1.Login`) é a única chamada aceita sem sessão: o controller confere a credencial do serviço contra o hash bcrypt guardado no `n3x.yaml` do controller, com limite de tentativas por IP e por serviço
-- O controller não guarda tokens; a chave HMAC é do plugin core: vem de `session.hmac_key` (em `ENC[...]`, opcional e recomendada em produção) na seção do core no `n3x.yaml` do controller ou, sem ela, são 32 bytes aleatórios gerados na subida e mantidos só em memória
+- O controller não guarda tokens; a chave HMAC é do plugin core: vem de `session.hmac_key` (só em `ENC[...]`, opcional e recomendada em produção; chave em claro é recusada e o controller não sobe) na seção do core no `n3x.yaml` do controller ou, sem ela, são 32 bytes aleatórios gerados na subida e mantidos só em memória
 - O token é um HMAC-SHA256 sobre serviço, instância, emissão, expiração e nonce, com TTL de 1 h, conferido com comparação em tempo constante
 - A chamada segue para o serviço do plugin, com a identidade do chamador no contexto
 - Toda chamada gera métrica e log com a identidade do chamador
@@ -224,14 +224,14 @@ O controller, por meio do plugin core, mantém o registro de cada sidecar e most
 
 **Fluxos alternativos e exceções**
 - Sidecar reconecta com a mesma identidade, como num restart do container no mesmo pod: o registro é atualizado, sem duplicar
-- Sidecar desconectado por mais tempo que o limite do `n3x.yaml` (padrão de 24 h): sai da lista ativa e fica só no histórico
-- Instâncias do mesmo serviço com hashes de config ou manifestos diferentes, como num rollout em andamento: o painel destaca a divergência
+- Sidecar desconectado por mais tempo que o limite do `n3x.yaml` (padrão de 24 h): é removido do inventário (não há fase de histórico separada: o `inventory_retention` é o tempo total que o sidecar desconectado permanece em memória)
+- Instâncias do mesmo serviço com hashes de config ou manifestos diferentes, como num rollout em andamento: o painel destaca a divergência; a diferença que vem só do `format` da config efetiva (upgrade do core) não conta como divergência e aparece como "versões do core diferentes"
 - Lista de plugins do sidecar diferente da lista compilada no controller: o painel alerta, com base no manifesto anunciado
 - Restart do controller: o inventário, que fica só em memória, é reconstruído pelos sidecars; quando o controller não conhece a instância, o heartbeat pede o reenvio do registro e, com `session.hmac_key` configurada, o inventário volta em cerca de 10 s
 
 **Erros previstos**
 - Duas instâncias com a mesma identidade (segundo registro com outro nonce enquanto o primeiro stream está aberto, e as duas mandando heartbeat no mesmo intervalo): o controller marca conflito de identidade no painel e no log, as duas continuam conectadas e o conflito some sozinho após 3 intervalos sem heartbeat da antiga
-- Teto de memória do plugin core estourado (`memory_limit`, padrão de 128 MiB): ao chegar a 90%, o core descarta primeiro o histórico, depois os eventos mais antigos e depois versões de config sem instância; se ainda assim estourar, se marca como degradado, o painel mostra o banner (FR-008), continua aceitando heartbeats e estados e recusa nova versão de config com `RESOURCE_EXHAUSTED`
+- Teto de memória do plugin core estourado (`memory_limit`, padrão de 128 MiB): ao chegar a 90%, o core descarta primeiro os sidecars desconectados mais antigos, depois os eventos mais antigos e depois versões de config sem instância; se ainda assim estourar, se marca como degradado, o painel mostra o banner (FR-008), continua aceitando heartbeats e estados e recusa nova versão de config com `RESOURCE_EXHAUSTED`
 
 **Prioridade:** alta
 
@@ -242,17 +242,17 @@ O controller mostra no painel a config efetiva de cada sidecar, enviada pelo plu
 
 **Fluxo principal**
 - Quando o sidecar sobe, o plugin core envia a config efetiva, com os valores sensíveis mascarados, e o hash dela; a config efetiva inclui a seção `plugins` e os parâmetros do sidecar, inclusive os da conexão com o controller
-- A config efetiva vai em JSON canônico (RFC 8785): `format`, `sidecar` com os parâmetros do sidecar e `plugins` com ID, instância, fase, ordem, política de falha e config de cada plugin
+- A config efetiva vai em JSON canônico (RFC 8785): `format`, `sidecar` com os parâmetros do sidecar e `plugins` com ID, instância, fase, ordem, política de falha, `async`, `match` e config de cada plugin, ordenados por fase, ordem e instância; inteiros fora de ±(2^53 − 1) saem como texto, para não perder precisão
 - Todo campo marcado como segredo no schema (`plugin.Secret`), e também o `controller.secret` do sidecar, vira `***:<impressão digital>`, com os 12 primeiros caracteres hexadecimais do SHA-256 do texto `ENC[...]`, nunca do valor em claro; um segredo trocado muda o hash sem expor o valor
 - O hash é `sha256:<hex>` sobre o JSON já mascarado, e o controller o recalcula ao receber
-- O plugin core guarda a config em memória, por serviço e por instância, versionada pelo hash, com até 20 versões por serviço (descartando primeiro as que nenhuma instância usa)
+- O plugin core guarda a config em memória, por serviço e por instância, versionada pelo hash, com até 20 versões por serviço (descartando primeiro as que nenhuma instância usa; uma versão em uso por instância viva nunca é descartada, então o serviço pode passar de 20)
 - O painel mostra, por serviço, a cadeia de plugins (fase, ordem e política de falha) e a config de cada instância de plugin, só para leitura
 - Quando uma instância sobe com um hash diferente do anterior do serviço, o painel mostra a mudança com o diff; o registro dela em auditoria fica para a v2 (FR-010)
 
 **Fluxos alternativos e exceções**
 - Instâncias do mesmo serviço com configs diferentes (rollout em andamento ou drift): o painel mostra os grupos lado a lado, com o diff
 - Plugin com schema: o painel exibe cada campo com nome e descrição; sem schema, mostra o YAML bruto
-- O usuário pode copiar o trecho YAML de um plugin para usar no `n3x.yaml` de outro serviço
+- O usuário pode copiar ou baixar o trecho YAML de um plugin (sem JavaScript no painel) para usar no `n3x.yaml` de outro serviço; os segredos saem trocados por um texto que falha na validação do `n3x.yaml`
 
 **Erros previstos**
 - Config recebida sem hash: o controller recusa com `INVALID_ARGUMENT`; hash que não bate com o recalculado (config corrompida): o controller recusa com `DATA_LOSS` e loga; nos dois casos, o painel mantém a última config válida e marca o sidecar com alerta
@@ -276,6 +276,7 @@ Interface web servida pelo próprio controller, em Echo v5 + templ + htmx, para 
 - A tela de auditoria não entra na v1 (FR-010)
 - As telas fornecidas por plugins aparecem no menu (FR-011), desenhadas pelo renderizador de widgets do SDK com o mesmo visual do painel
 - As atualizações de tela são parciais, via htmx, sem SPA; o status ao vivo usa polling curto (padrão de 5 s)
+- As listas do painel podem ser exportadas em CSV e JSON, sem nenhuma coluna de endereço ou IP (o endereço anunciado aparece só no detalhe do sidecar)
 
 **Fluxos alternativos e exceções**
 - Usuário de leitura: vê tudo, menos a lista de usuários
@@ -297,7 +298,7 @@ O controller tem um único root, definido no `n3x.yaml` do controller com a senh
 - O operador gera o hash bcrypt da senha do root com `n3x-controller hash` ou qualquer ferramenta padrão (ex.: `htpasswd -B`) e coloca usuário e hash no `n3x.yaml` do controller
 - O controller sobe e lê o root do arquivo; o root nunca fica em banco, vem sempre do `n3x.yaml`
 - O root faz login no painel e o controller compara a senha com o hash
-- O operador declara os usuários de leitura em `plugins.n3x.core.users` no `n3x.yaml` do controller, cada um com nome, `password_hash` bcrypt (custo mínimo 12, campo segredo no schema) e `disabled`; o plugin core lê a lista na subida e a mantém em memória
+- O operador declara os usuários de leitura em `plugins.n3x.core.users` no `n3x.yaml` do controller, cada um com nome (`^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$`, até 100 usuários; duplicidade e igualdade ao root comparadas sem diferenciar maiúsculas, login sensível à caixa), `password_hash` bcrypt (custo de 12 a 16, campo segredo no schema) e `disabled`; o plugin core lê a lista na subida e a mantém em memória; lista vazia é válida (só o root entra)
 - O root vê no painel a lista dos usuários de leitura, com nome e estado, sem nenhuma ação
 - O usuário de leitura faz login e vê o painel em modo leitura (FR-008)
 
@@ -310,7 +311,7 @@ O controller tem um único root, definido no `n3x.yaml` do controller com a senh
 **Erros previstos**
 - Login inválido: mensagem genérica, sem revelar se o usuário existe; depois de 5 tentativas seguidas, o login fica bloqueado por 15 minutos para aquele usuário e IP
 - `n3x.yaml` sem root, ou com um hash que não é bcrypt: o controller não sobe
-- Seção de usuários com nome duplicado, nome igual ao do root, hash que não é bcrypt ou custo menor que 12: o controller não sobe
+- Seção de usuários com nome duplicado, nome igual ao do root, hash que não é bcrypt ou custo fora da faixa de 12 a 16: o controller não sobe
 - Usuário de leitura tentando abrir a lista de usuários: 403
 
 **Prioridade:** alta
@@ -796,9 +797,9 @@ Checklist objetivo que define se a feature está pronta.
 - Dois builds do mesmo Dockerfile em máquinas diferentes geram o mesmo hash no manifesto
 - O painel mostra, para cada sidecar, serviço, instância (nome do pod ou ID do container), alvo, versão do Envoy, plugins e hash da config, e destaca com o diff as instâncias do mesmo serviço com configs diferentes
 - Nenhuma tela do painel permite alterar a config de um sidecar nem criar, desativar, remover ou trocar a senha de usuários, e o usuário de leitura não acessa a lista de usuários (o servidor responde 403)
-- O root e os usuários de leitura vêm só do `n3x.yaml` do controller, com hash bcrypt de custo mínimo 12; um nome duplicado ou igual ao do root impede a subida, e 5 logins inválidos seguidos bloqueiam o acesso por 15 minutos
+- O root e os usuários de leitura vêm só do `n3x.yaml` do controller, com hash bcrypt de custo de 12 a 16; um nome duplicado ou igual ao do root impede a subida, e 5 logins inválidos seguidos bloqueiam o acesso por 15 minutos
 - Login, logout e bloqueio do painel aparecem no log JSON operacional do controller, sem nenhum segredo; a auditoria formal fica para a v2
-- A config efetiva chega em JSON canônico, com segredos só como `***:<impressão digital>` ou `***:plain`; uma config com hash que não bate é recusada com `DATA_LOSS` e o painel mantém a última válida, com alerta
+- A config efetiva chega em JSON canônico, com segredos só como `***:<impressão digital>` ou `***:plain` (e, para a config inteira de uma instância de plugin que o core não consegue mascarar com segurança ou que passa do limite de tamanho, `***:opaque` ou `***:omitted:<impressão digital>`); uma config com hash que não bate é recusada com `DATA_LOSS` e o painel mantém a última válida, com alerta
 - Com o teto de memória do plugin core estourado, o painel mostra o banner de degradado, os heartbeats seguem aceitos e uma nova versão de config é recusada com `RESOURCE_EXHAUSTED`
 - Um sidecar com credencial inválida é recusado no login com `UNAUTHENTICATED`, assim como qualquer chamada sem sessão válida, as conexões usam TLS 1.3 e um teste automatizado confirma que nenhum segredo aparece em logs, erros ou na config enviada ao controller
 - No benchmark open-loop a 1.000 rps, a latência adicionada pelo sidecar fica em p50 menor ou igual a 0,5 ms e p99 menor ou igual a 2 ms; o sidecar ocioso usa até 100 MB e 0,05 vCPU e fica pronto em até 5 s

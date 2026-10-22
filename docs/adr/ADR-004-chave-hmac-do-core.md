@@ -10,7 +10,8 @@ O core emite e valida o token de sessão, mas o HLD do controller previa que o h
 - A chave HMAC pertence ao core.
 - Por padrão, o core gera 32 bytes de `crypto/rand` no `Start`.
 - Opcionalmente, aceita `session.hmac_key: ENC[...]` na própria seção do `n3x.yaml`. Esse é o caminho recomendado em produção.
-- Sem a chave configurada, a `Validate` emite um aviso no log.
+- Sem a chave configurada, o `New` emite um aviso no log (`hmac_key_missing`).
+- A chave só é aceita em `ENC[...]`; em claro, a `Validate` recusa (regra `hmac_key_not_sealed`) e o controller não sobe.
 - O `keys.hmac_file` sai do `n3x.yaml` do host do controller.
 - Rotação: trocar no yaml e reiniciar o controller, o que força um único novo login de todos os sidecars.
 

@@ -17,6 +17,7 @@ A ADR-022 do SDK define que as métricas de plugin usam o prefixo `n3x_<namespac
   - `memory_bytes`
   - `degraded`
   - `heartbeat_lag_seconds`
+- **Catálogo completo:** o conjunto acima é o núcleo. O catálogo único das famílias `n3x_n3x_core_*` (35 da metade de controller e 12 da de proxy, entre elas `token_rejections_total`, `hmac_key_configured`, `session_index_entries`, `session_invalidations_total`, `events_rejected_total`, `heartbeat_streams`, `config_versions` e `panel_build_seconds`) fica em `internal/metricdefs`, especificado na FDD CORE-09.
 - **Métricas do sidecar:** as que já existem (`n3x_controller_*`, definidas no HLD do sidecar) continuam como estão, alimentadas pelo core.
 - **Tracing:** não há tracing distribuído na v1. A correlação é feita pelo `x-request-id` e pelo par serviço e instância nos logs.
 

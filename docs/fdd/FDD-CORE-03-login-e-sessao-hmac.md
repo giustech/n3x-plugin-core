@@ -58,7 +58,12 @@ Responsável: Guilherme Giusti
   - **L-09 fechada aqui:** o token fica num campo privado da instância do core (`atomic.Pointer` no `session.Manager`), nunca em `env.Memory()` (contrato 6; atende o pedido da FDD 04)
   - **L-08 aplicada** (fechada na FDD 38): o teto é da visão do `Env`; o interceptor do core não impõe teto; o login escapa do teto de 5 s pelo método completo e usa `controller.timeouts.login` (10 s)
   - **L-02 aplicada** (fechada na FDD 09, implementada na FDD 33): o IP do `Verify` vem de `CallerIP(ctx)`; sem IP, `netip.Addr{}`, que o verificador põe no balde `unknown` (FDD 31)
-  - **L-11, L-12, L-13, L-34 e L-64 aplicadas:** serviço `Login` próprio; métricas de sessão do sidecar pelo `SessionReporter`; `x-request-id` no login; caminhos `plugins["n3x.core"].session.hmac_key`; `hmac_key` em claro aceita com aviso
+- Decisões aprovadas pelo responsável do produto em 2026-10-22:
+  - **D-01:** `session.hmac_key` só é aceita em `ENC[...]`; chave em claro é recusada na `Validate` (regra `hmac_key_not_sealed`, nome proposto) e o controller não sobe. Isso restringe a L-64, que continua valendo só para `password_hash`. O PRD já descrevia a chave "em `ENC[...]`"; a FDD 01 (D-05) e as FDDs que citam o aviso `hmac_key_in_clear` seguem esta decisão
+  - **D-02:** formato do token em texto `v1.<kid>.<iat>.<exp>.<nonce>.<serviço>.<instância>.<MAC>`, com `iat` aceito até 2 min no futuro, validade de 5 min a 24 h e renovação em 0,8 × L com jitter de ±10% lida do próprio token (hipóteses H-01, H-02, H-06, H-07 e H-08 confirmadas)
+  - **D-03:** aprovadas as métricas novas `n3x_n3x_core_token_rejections_total{reason}`, `n3x_n3x_core_hmac_key_configured`, `n3x_n3x_core_session_index_entries` e `n3x_n3x_core_session_invalidations_total{cause}` e o índice de sessões limitado a 16.384 nonces. O ADR-010 e o HLD precisam listá-las (reflexo pendente)
+- Lacunas do README (continuação):
+  - **L-11, L-12, L-13, L-34 e L-64 aplicadas:** serviço `Login` próprio; métricas de sessão do sidecar pelo `SessionReporter`; `x-request-id` no login; caminhos `plugins["n3x.core"].session.hmac_key`; `hmac_key` em claro recusada (D-01 abaixo)
 - Pedidos de FDDs anteriores atendidos: FDD 03 (aviso de `hmac_key` em claro; chave como base64 de 32 bytes do `keygen`), FDD 04 (token fora do `memory.Map`), FDD 08 (regras da sessão na `Validate`, aviso no `New`, `Session` igual ao nonce), FDD 09 (0 alocações no `Authenticate`, chamadas ao `SessionReporter`, classificação dos códigos, P-05), FDD 12 (`AssertZeroAllocsFunc` sobre `Authenticate`, testes com `ctrltest` e `Link`), FDD 16 (dados de sessão pela capacidade), FDD 31 (`NewSecret` sem log, sentinelas devolvidas como estão, jitter de 1 s a 60 s com primeira espera curta, renovação que acerta o cache), FDD 33 (`Authenticate` sem I/O, respeitando o `ctx`, `ErrUnauthenticated` sem token, token pequeno), FDD 36 (`hmac_key_format`, avisos no `New`, interceptor que pula o `Login`, P-02 e P-05), FDD 38 (interceptor sem teto, comportamento sem sessão, P-01), FDD 40 (sessão antes dos usuários na `Validate`)
 
 ---
@@ -80,7 +85,7 @@ Responsável: Guilherme Giusti
 
 **Incluído**
 - Pacote `internal/sessiontoken` (só biblioteca padrão): formato `v1` do token, cabeçalho `Bearer`, `Key` com `Sign` e `Verify`, `Inspect` sem chave, vetores golden e fuzzing (contrato 2)
-- `controller/auth`: `Authority` com a chave (configurada ou aleatória), handler `Login` da tabela pública, emissão do token, `Authenticate`, índice limitado de sessões vistas para a FDD 43, `ValidateSession` com a regra `hmac_key_format`, avisos `hmac_key_missing` e `hmac_key_in_clear`, métricas e logs (contratos 1, 3, 4 e 5)
+- `controller/auth`: `Authority` com a chave (configurada ou aleatória), handler `Login` da tabela pública, emissão do token, `Authenticate`, índice limitado de sessões vistas para a FDD 43, `ValidateSession` com as regras `hmac_key_format` e `hmac_key_not_sealed`, aviso `hmac_key_missing`, métricas e logs (contratos 1, 3, 4 e 5)
 - Ligação na metade de controller: `controller.New`, `Start`, `PublicGRPC`, `Authenticate` e a composição `Config.Validate` (sessão antes dos usuários) (contrato 5)
 - `agent/session`: `Manager` com o laço de login (tarefa de fundo `session`), guarda do token em campo privado, interceptors unário e de stream entregues por `ConnInterceptors()`, renovação em 80% com jitter de 10%, novo login com backoff e jitter, detecção de recusa, `SessionReporter`, e o gatilho `Next` para a FDD 42 (contratos 6, 7 e 8)
 - Comportamento das chamadas dos plugins enquanto o login não completa e durante a troca de token
@@ -103,7 +108,7 @@ Responsável: Guilherme Giusti
 
 **Fluxo de subida do controller (metade de controller do core)**
 1. Fase de config (FDD 08, contrato 15 da FDD 09): `Config.Validate()` roda `auth.ValidateSession(c.Session)` e depois `directory.ValidateUsers(c.Users)` (ordem dos campos da struct, FDD 40). A regra `hmac_key_format` confere a chave aberta; com `--skip key`, o texto ainda é um envelope `ENC[...]` e a regra é pulada.
-2. `controller.New`: `auth.New(auth.Options{Session: cfg.Session, Metrics, Log})`. Com `hmac_key` presente, decodifica os 32 bytes e guarda a origem `config`; se o texto veio sem `ENC[...]` (`InClear()`), loga `hmac_key_in_clear` (warn). Sem `hmac_key` (ausente ou vazia, `IsZero()`), marca a origem `random` e loga `hmac_key_missing` (warn). Cria as métricas (`New` é o único lugar em que o SDK aceita criar famílias).
+2. `controller.New`: `auth.New(auth.Options{Session: cfg.Session, Metrics, Log})`. Com `hmac_key` presente, decodifica os 32 bytes e guarda a origem `config`; o texto sem `ENC[...]` (`InClear()`) já foi recusado na `Validate` pela regra `hmac_key_not_sealed`; se chegar ao `New` assim (só em teste, sem a `Validate`), devolve `auth.ErrInvalidKey`. Sem `hmac_key` (ausente ou vazia, `IsZero()`), marca a origem `random` e loga `hmac_key_missing` (warn). Cria as métricas (`New` é o único lugar em que o SDK aceita criar famílias).
 3. `controller.Start`: `a.Start()`. Com origem `random`, lê 32 bytes de `crypto/rand`. Deriva o identificador da chave (`kid`, 8 hex), monta a lista livre de estados de HMAC e publica a autoridade num ponteiro atômico. Loga `session_authority_ready` com `key_source`, `kid` e `ttl`.
 4. `PublicGRPC`: registra `corev1.RegisterLoginServer(r, a.LoginServer(cenv))` na tabela pública (FDD 09, contrato 10).
 5. O host liga `core.Authenticate` ao interceptor de autenticação (FDD 33) depois que todos os plugins sobem.
@@ -577,7 +582,7 @@ info, ok := c.auth.Session(id.Session)
 - Semântica de status/headers:
   - **`ttl`:** validade de cada token, em segundos inteiros (fração de segundo ignorada); mudar exige restart; tokens já emitidos valem pelo `exp` que levam
   - **`hmac_key` ausente ou vazia** (`IsZero()`, H-10 da FDD 36): chave aleatória a cada subida; todo restart invalida as sessões e gera um novo login de cada sidecar; aviso `hmac_key_missing` (warn) uma vez por processo no `New`; `n3x_n3x_core_hmac_key_configured` igual a 0
-  - **`hmac_key` em claro** (`InClear()`): aceita (L-64), aviso `hmac_key_in_clear` (warn) com `path`, uma vez no `New`; recomendado `ENC[...]` com a AAD `n3x:v1:controller:n3x.core` (FDD 03, L-05)
+  - **`hmac_key` em claro** (`InClear()`): recusada (D-01). A `Validate` devolve a regra `hmac_key_not_sealed` no caminho `session.hmac_key`, sem o valor, e o controller não sobe. Só `ENC[...]` é aceito, cifrado com a AAD `n3x:v1:controller:n3x.core` (FDD 03, L-05). A recusa vale também com `--skip key`, porque o texto sem `ENC[...]` é reconhecível sem abrir segredo
   - **`hmac_key` em `ENC[...]`** (`Sealed()`): caminho recomendado em produção; sobrevive ao restart, então um restart não gera login (ADR-004)
   - **Rotação:** trocar a `hmac_key` e reiniciar o controller força exatamente um novo login de cada sidecar (motivo `key` no log do host); não há janela com as duas chaves na v1
   - **Revogação:** não há armazenamento; uma sessão vale até o `exp`. Para cortar todas: trocar a chave e reiniciar. Para cortar um serviço: trocar o `secret_hash` dele no `n3x.yaml` do host e reiniciar com chave nova, porque, com a mesma chave, os tokens já emitidos valem até o `exp` (ADR-003 do `n3x-sdk`, "sem revogação de uma sessão específica")
@@ -808,7 +813,7 @@ _, err3 := cli.Report(ctx, req) // controller reiniciado sem hmac_key, token ant
 | Token de outro serviço | Aceito como do serviço do token; nunca vira outro serviço | Amarração do ADR-005 |
 | `hmac_key` fora do formato | `hmac_key_format` na `Validate`; controller não sobe | Com `--skip key`, regra pulada para envelope |
 | `hmac_key` ausente | Chave aleatória; `hmac_key_missing` | ADR-004 |
-| `hmac_key` em claro | Aceita; `hmac_key_in_clear` | L-64 |
+| `hmac_key` em claro | `hmac_key_not_sealed` na `Validate`; controller não sobe | D-01 (substitui a L-64 para esta chave; `password_hash` segue aceito em claro) |
 | Chave inválida no `New` (sem `Validate`) | `ErrInvalidKey`; o core não sobe | Defesa |
 | Índice de sessões cheio | Nonce novo não entra; `Session(nonce)` dá `false`; `session_index_full` 1 por minuto | A FDD 43 usa a hora do `Register` como reserva |
 | Sidecar sem sessão, login em andamento | Chamada espera dentro do prazo; depois `UNAVAILABLE` | FR-002 |
@@ -872,7 +877,7 @@ _, err3 := cli.Report(ctx, req) // controller reiniciado sem hmac_key, token ant
 | Evento (`msg`) | Nível | Campos | Processo | Amostragem |
 | --- | --- | --- | --- | --- |
 | `hmac_key_missing` | warn | `plugin_id`, `detail` | controller | uma vez por processo (FDD 36) |
-| `hmac_key_in_clear` | warn | `plugin_id`, `path` | controller | uma vez por processo (FDD 36) |
+| `hmac_key_in_clear` | (removido) | | | Substituído pela recusa `hmac_key_not_sealed` na `Validate` (D-01) |
 | `session_authority_ready` | info | `key_source` (`config`, `random`), `kid` (da chave atual), `ttl` | controller | uma vez, no `Start` |
 | `session_issued` | debug | `service`, `instance`, `ttl`, `request_id` | controller | cada login |
 | `login_invalid_request` | info | `field`, `request_id`, `count` | controller | no máximo 1 por segundo |
@@ -946,7 +951,7 @@ _, err3 := cli.Report(ctx, req) // controller reiniciado sem hmac_key, token ant
 - **Volta ao painel em até 30 s** (critério do PRD): medido de ponta a ponta na FDD 48 com e sem `hmac_key`; nesta FDD, o caminho do sidecar até o novo token, depois da primeira recusa, termina em no máximo 1 s mais a duração do `Login`
 - **Conformidade:** `hostconformance.RunCoreEnv(t, ctrltest.Harness(), hostconformance.WithCore(controller.Plugin()))` passa inteiro no `n3x-plugin-core`, inclusive `authorization` retirado e identidade válida; `conformance.RunCore` da FDD 07 passa com o core real (interceptor o mais interno, `ConnInterceptors()` chamado uma vez); teste de duas metades com `ctrltest.Link` faz login, chama um serviço de teste e renova em 48 min de relógio falso
 - **Validação:** `hmac_key` com 31 bytes, 33 bytes, base64url, sem padding ou com texto qualquer dá `hmac_key_format` com caminho `plugins["n3x.core"].session.hmac_key`; a saída do `keygen` passa, com e sem `\n` final; com `secret.FormatChecker()` (`--skip key`), um envelope passa sem problema; a ordem dos problemas é schema, sessão, usuários (exemplo conjunto com a FDD 40); canário em `hmac_key` com 0 ocorrência em `err.Error()`
-- **Avisos:** sem `hmac_key`, `hmac_key_missing` sai exatamente uma vez e `n3x_n3x_core_hmac_key_configured` vale 0; em claro, `hmac_key_in_clear` uma vez; selada, nenhum dos dois
+- **Avisos e recusa:** sem `hmac_key`, `hmac_key_missing` sai exatamente uma vez e `n3x_n3x_core_hmac_key_configured` vale 0; em claro, a `Validate` devolve `hmac_key_not_sealed` e o controller não sobe; selada, nenhum aviso
 - **Varredura de segredos:** com o canário `n3x-canary-` como `controller.secret` e como `hmac_key`, e com o texto exato de cada token emitido no teste, `secrettest.Leaks` não acha nada nos logs, erros, status e métricas dos dois lados
 - **Dependências e qualidade:** `go list -deps ./internal/sessiontoken` só lista biblioteca padrão; `go list -deps ./agent/...` não lista `n3x-sdk/controller`; `go vet` e `go test -race ./...` passam; cobertura de linhas de no mínimo 90% em `internal/sessiontoken`, `controller/auth` e `agent/session` (hipótese, igual às FDDs anteriores); a constante `skeleton` da versão mínima (FDD 36) sai de `agent` e de `controller` quando esta FDD e as 40 e 42 estiverem implementadas
 
