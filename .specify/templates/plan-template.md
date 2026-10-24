@@ -40,7 +40,27 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+Portões da constituição (`.specify/memory/constitution.md`, v1.0.0). Marque cada item; toda violação
+precisa de justificativa em "Complexity Tracking".
+
+- [ ] **I. Fora do caminho da requisição:** nenhuma fase ou hook de requisição; trabalho só em
+  `env.Background()`; falha do core ou do controller não afeta o tráfego.
+- [ ] **II. Segredo nunca sai:** nenhum segredo, token ou config sem máscara em log, erro, métrica, evento
+  ou tela; teste de canário (`secrettest.Leaks` = 0) previsto.
+- [ ] **III. Sidecar como fonte de verdade:** nada escreve config de sidecar; estado reconstruível depois
+  de restart; identidade vem do token.
+- [ ] **IV. Contratos só por adição:** mudanças de proto, formato da config efetiva e schema são aditivas;
+  `buf breaking` e goldens cobertos.
+- [ ] **V. Memória limitada:** todo dado novo tem teto, retenção e lugar na ordem de descarte; estado
+  degradado tratado.
+- [ ] **VI. Dono único e mínimo privilégio:** papéis e rotas corretos; nenhuma rota pública nova; regras
+  de LGPD respeitadas.
+- [ ] **VII. Plugin de referência:** só APIs públicas do SDK; análise estática sem `//n3x:allow`; regras
+  de import; métricas só no catálogo `internal/metricdefs`.
+- [ ] **VIII. Teste primeiro:** testes escritos antes e falhando; cobertura ≥ 90%; `-race`, fuzzing e
+  benchmarks que medem as metas numéricas.
+- [ ] **IX. Simplicidade na v1:** sem banco, disco, auditoria, tracing ou réplica extra; armazenamento só
+  pela porta `Store`.
 
 ## Project Structure
 
@@ -62,6 +82,10 @@ specs/[###-feature]/
   for this feature. Delete unused options and expand the chosen structure with
   real paths (e.g., apps/admin, packages/something). The delivered plan must
   not include Option labels.
+
+  Neste repositório (n3x-plugin-core), use a estrutura de plugin do SDK na raiz
+  do módulo Go: `proto/`, `types/`, `effconfig/`, `agent/`, `controller/`,
+  `internal/` e `tools/`, com testes `_test.go` no mesmo pacote do código.
 -->
 
 ```text
